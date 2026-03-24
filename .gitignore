@@ -1,0 +1,27 @@
+# Swift / Xcode build artefacts
+.build/
+.swiftpm/
+*.o
+*.d
+*.swp
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+
+# Xcode project files generated from Package.swift
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Metrics CSV output (generated at runtime)
+*.csv
+
+# Logs
+*.log
