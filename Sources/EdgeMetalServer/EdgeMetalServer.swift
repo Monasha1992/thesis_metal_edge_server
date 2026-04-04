@@ -79,14 +79,29 @@ struct EdgeMetalServer {
                     frame: frame
                 )
                 
-                // Extract and send volume data
-                let voxels = metal.extractNonEmptyVoxels()
-                let voxelData = MetalPipeline.serializeVoxels(voxels)
+                // Generate mesh
+                let mesh = metal.generateMesh(frame: frame)
+                print("Mesh: \(mesh.vertexCount) verts, \(mesh.triangleCount) tris")
 
-                // Send with header: type 0x02, then length, then payload
+                // Serialize: 4 bytes vertCount + 4 bytes indexCount + vertex data + index data
+                var payload = Data()
+                var vertCount = UInt32(mesh.vertexCount)
+                var idxCount = UInt32(mesh.indices.count)
+                payload.append(Data(bytes: &vertCount, count: 4))
+                payload.append(Data(bytes: &idxCount, count: 4))
+
+                // Vertices: 6 floats each (pos.xyz + norm.xyz)
+                var verts = mesh.vertices
+                payload.append(Data(bytes: &verts, count: verts.count * 4))
+
+                // Indices
+                var indices = mesh.indices
+                payload.append(Data(bytes: &indices, count: indices.count * 4))
+
+                // Send with header: type 0x03 for mesh data
                 var response = Data()
-                response.append(0x02)  // message type: volume data
-                var len = UInt32(voxelData.count)
+                response.append(0x03)
+                let len = UInt32(payload.count)
                 let lenBytes = Data([
                     UInt8((len >> 24) & 0xFF),
                     UInt8((len >> 16) & 0xFF),
@@ -94,10 +109,10 @@ struct EdgeMetalServer {
                     UInt8(len & 0xFF)
                 ])
                 response.append(lenBytes)
-                response.append(voxelData)
+                response.append(payload)
 
                 connection.send(content: response, completion: .contentProcessed { _ in
-                    print("Sent \(voxels.count) voxels (\(response.count) bytes)")
+                    print("Sent mesh: \(mesh.vertexCount) verts, \(mesh.triangleCount) tris (\(response.count) bytes)")
                 })
 
                 // Listen for next message

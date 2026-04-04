@@ -23,6 +23,9 @@ class MetalPipeline: @unchecked Sendable {
     var normalsTexture: MTLTexture?
     
     let extractPipeline: MTLComputePipelineState
+    
+    let vertexPipeline: MTLComputePipelineState
+    let indexPipeline: MTLComputePipelineState
 
     init() {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -52,6 +55,12 @@ class MetalPipeline: @unchecked Sendable {
         
         let extractFunc = library.makeFunction(name: "extractNonEmpty")!
         self.extractPipeline = try! device.makeComputePipelineState(function: extractFunc)
+
+        let vertFunc = library.makeFunction(name: "surfaceNetsVertices")!
+        self.vertexPipeline = try! device.makeComputePipelineState(function: vertFunc)
+
+        let idxFunc = library.makeFunction(name: "surfaceNetsIndices")!
+        self.indexPipeline = try! device.makeComputePipelineState(function: idxFunc)
 
         print("Metal device: \(device.name)")
         print("IntegrateParams size: \(MemoryLayout<IntegrateParams>.size), stride: \(MemoryLayout<IntegrateParams>.stride)")
@@ -204,7 +213,7 @@ class MetalPipeline: @unchecked Sendable {
 
         let desc = MTLTextureDescriptor()
         desc.textureType = .type3D
-        desc.pixelFormat = .r32Float
+        desc.pixelFormat = .rg32Float
         desc.width = Int(frame.voxelCount.x)
         desc.height = Int(frame.voxelCount.y)
         desc.depth = Int(frame.voxelCount.z)
@@ -225,7 +234,7 @@ class MetalPipeline: @unchecked Sendable {
         let proj = frame.proj[0]
         let voxelSize = frame.voxelSize
         let maxDist = frame.maxUpdateDist
-        let minDist: Float = 1.0
+        let minDist: Float = 0.1
 
         // Decompose projection to get frustum slopes
         let near = abs(proj[2][3] * 0.5)
@@ -514,6 +523,120 @@ class MetalPipeline: @unchecked Sendable {
         }
 
         return data
+    }
+    
+    struct MeshParams {
+        var voxCount: SIMD3<Int32>
+        var voxSize: Float
+        var regionMin: SIMD3<Int32>
+        var regionMax: SIMD3<Int32>
+    }
+
+    struct MeshResult {
+        var vertices: [Float]   // packed: px, py, pz, nx, ny, nz per vertex
+        var indices: [UInt32]
+        var vertexCount: Int
+        var triangleCount: Int
+    }
+
+    var coordVertMapBuffer: MTLBuffer?
+
+    func generateMesh(frame: DepthFrame) -> MeshResult {
+        guard let volume = volumeTexture else { return MeshResult(vertices: [], indices: [], vertexCount: 0, triangleCount: 0) }
+
+        let voxCount = SIMD3<Int32>(frame.voxelCount.x, frame.voxelCount.y, frame.voxelCount.z)
+        let totalVoxels = Int(voxCount.x) * Int(voxCount.y) * Int(voxCount.z)
+
+        // Compute bounding box from camera position + frustum extent (no GPU readback)
+        let eyeCol = frame.viewInv[0][3]
+        let eyeWorld = SIMD3<Float>(eyeCol.x, eyeCol.y, eyeCol.z)
+        let extentVox = Int32(frame.maxUpdateDist / frame.voxelSize) + 2
+        let eyeVox = SIMD3<Int32>(
+            Int32(eyeWorld.x / frame.voxelSize + Float(voxCount.x) * 0.5),
+            Int32(eyeWorld.y / frame.voxelSize + Float(voxCount.y) * 0.5),
+            Int32(eyeWorld.z / frame.voxelSize + Float(voxCount.z) * 0.5)
+        )
+        let regionMin = max(eyeVox &- extentVox, SIMD3<Int32>(0, 0, 0))
+        let regionMax = min(eyeVox &+ extentVox, voxCount)
+        let regionSize = regionMax &- regionMin
+        let regionTotal = Int(regionSize.x) * Int(regionSize.y) * Int(regionSize.z)
+        print("Mesh region: \(regionMin) to \(regionMax), size \(regionSize), total \(regionTotal)")
+
+        let maxVertices = regionTotal / 3
+        let maxTriIndices = regionTotal * 6
+
+        // Create coordVertMap once, reuse it
+        if coordVertMapBuffer == nil || coordVertMapBuffer!.length < totalVoxels * 4 {
+            coordVertMapBuffer = device.makeBuffer(length: totalVoxels * 4, options: .storageModeShared)!
+        }
+        memset(coordVertMapBuffer!.contents(), 0xFF, totalVoxels * 4)
+
+        let vertexBuffer = device.makeBuffer(length: max(maxVertices * 24, 24), options: .storageModeShared)!
+        let vertCountBuffer = device.makeBuffer(length: 4, options: .storageModeShared)!
+        let triBuffer = device.makeBuffer(length: max(maxTriIndices * 4, 4), options: .storageModeShared)!
+        let triCountBuffer = device.makeBuffer(length: 4, options: .storageModeShared)!
+
+        vertCountBuffer.contents().storeBytes(of: Int32(0), as: Int32.self)
+        triCountBuffer.contents().storeBytes(of: Int32(0), as: Int32.self)
+
+        var params = MeshParams(
+            voxCount: voxCount,
+            voxSize: frame.voxelSize,
+            regionMin: regionMin,
+            regionMax: regionMax
+        )
+        
+        print("MeshParams size: \(MemoryLayout<MeshParams>.size), stride: \(MemoryLayout<MeshParams>.stride)")
+
+
+        let commandBuffer = commandQueue.makeCommandBuffer()!
+
+        // Vertex pass
+        let vertEncoder = commandBuffer.makeComputeCommandEncoder()!
+        vertEncoder.setComputePipelineState(vertexPipeline)
+        vertEncoder.setTexture(volume, index: 0)
+        vertEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
+        vertEncoder.setBuffer(vertCountBuffer, offset: 0, index: 1)
+        vertEncoder.setBuffer(coordVertMapBuffer!, offset: 0, index: 2)
+        vertEncoder.setBytes(&params, length: MemoryLayout<MeshParams>.size, index: 3)
+
+        let w1 = vertexPipeline.threadExecutionWidth
+        vertEncoder.dispatchThreads(
+            MTLSize(width: regionTotal, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: w1, height: 1, depth: 1)
+        )
+        vertEncoder.endEncoding()
+
+        // Index pass
+        let idxEncoder = commandBuffer.makeComputeCommandEncoder()!
+        idxEncoder.setComputePipelineState(indexPipeline)
+        idxEncoder.setTexture(volume, index: 0)
+        idxEncoder.setBuffer(coordVertMapBuffer!, offset: 0, index: 0)
+        idxEncoder.setBuffer(triBuffer, offset: 0, index: 1)
+        idxEncoder.setBuffer(triCountBuffer, offset: 0, index: 2)
+        idxEncoder.setBytes(&params, length: MemoryLayout<MeshParams>.size, index: 3)
+        idxEncoder.setBuffer(vertexBuffer, offset: 0, index: 4)
+
+        let w2 = indexPipeline.threadExecutionWidth
+        idxEncoder.dispatchThreads(
+            MTLSize(width: regionTotal, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: w2, height: 1, depth: 1)
+        )
+        idxEncoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let vertCount = Int(vertCountBuffer.contents().load(as: Int32.self))
+        let triCount = min(Int(triCountBuffer.contents().load(as: Int32.self)), maxTriIndices)
+
+        let vertPtr = vertexBuffer.contents().bindMemory(to: Float.self, capacity: vertCount * 6)
+        let verts = Array(UnsafeBufferPointer(start: vertPtr, count: vertCount * 6))
+
+        let idxPtr = triBuffer.contents().bindMemory(to: UInt32.self, capacity: triCount)
+        let indices = Array(UnsafeBufferPointer(start: idxPtr, count: triCount))
+
+        return MeshResult(vertices: verts, indices: indices, vertexCount: vertCount, triangleCount: triCount / 3)
     }
 
 }

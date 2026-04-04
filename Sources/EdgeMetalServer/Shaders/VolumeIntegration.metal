@@ -24,7 +24,7 @@ struct IntegrateParams {
 // --- Helper functions ---
 
 float3 eyePos(float4x4 viewInvMat) {
-    return float3(viewInvMat[0][3], viewInvMat[1][3], viewInvMat[2][3]);
+    return float3(viewInvMat[3][0], viewInvMat[3][1], viewInvMat[3][2]);
 }
 
 float4 worldToHCS(float3 worldPos, float4x4 viewMat, float4x4 projMat) {
@@ -74,7 +74,7 @@ kernel void clearVolume(
     uint3 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= volume.get_width() || gid.y >= volume.get_height() || gid.z >= volume.get_depth()) return;
-    volume.write(float4(EMPTY_VOXEL, 0, 0, 0), gid);
+    volume.write(float4(0.0, 0.0, 0, 0), gid); // R=tsdf, G=weight; weight=0 means unobserved
 }
 
 kernel void integrate(
@@ -123,11 +123,17 @@ kernel void integrate(
     float3 voxView = (params.view * float4(voxPos, 1.0)).xyz;
     bool acceptableDepthDisparity = depthLinear < dilatedDepthLinear + params.depthDispThresh;
     bool unoccludedByDilation = abs(voxView.z) < dilatedDepthLinear || acceptableDepthDisparity;
-    bool validSurfaceNormal = empty || normDot > MIN_DOT;
 
-    bool valid = withinBand && validSurfaceNormal && unoccludedByDilation;
-    if (valid) {
-        volume.write(float4(sDistNorm, 0, 0, 0), coord);
+    bool validSurfaceNormal = empty || normDot > 0.3;
+    if (withinBand && unoccludedByDilation && validSurfaceNormal) {
+        float2 existing = volume.read(uint3(coord)).rg;
+        float oldTsdf   = existing.r;
+        float oldWeight = existing.g;
+        float newWeight = min(oldWeight + 1.0, 30.0);
+        float newTsdf   = (oldWeight < 0.5)
+                          ? sDistNorm
+                          : (oldTsdf * oldWeight + sDistNorm) / newWeight;
+        volume.write(float4(newTsdf, newWeight, 0, 0), coord);
     }
 }
 
@@ -147,8 +153,9 @@ kernel void extractNonEmpty(
 ) {
     if (gid.x >= volume.get_width() || gid.y >= volume.get_height() || gid.z >= volume.get_depth()) return;
 
-    float val = volume.read(gid).r;
-    if (val == EMPTY_VOXEL) return;
+    float2 rg = volume.read(gid).rg;
+    if (rg.g < 0.5) return; // unobserved (weight == 0)
+    float val = rg.r;
 
     uint idx = atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
     if (idx >= maxOutput) return;

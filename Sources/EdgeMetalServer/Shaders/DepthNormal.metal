@@ -47,7 +47,7 @@ kernel void depthNormals(
 
     float3 dx = posR - posL;
     float3 dy = posU - posD;
-    float3 normal = normalize(cross(dx, dy));
+    float3 normal = normalize(cross(dy, dx));
 
     normTex.write(float4(normal, 1.0), gid);
 }
