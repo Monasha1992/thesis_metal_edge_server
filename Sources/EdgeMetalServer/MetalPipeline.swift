@@ -244,8 +244,13 @@ class MetalPipeline: @unchecked Sendable {
     // HOW IT WORKS (jump-flood):
     //   Instead of one pass checking every pixel, we run `dilationSteps` passes.
     //   Each pass samples neighbours at distance `stepSize` pixels, where stepSize
-    //   halves every pass: 256 → 128 → 64 → 32 → 16 → 8 → 4 → 2 (→ 1)
-    //   This fills gaps up to 256 pixels wide in just 8 passes.
+    //   halves every pass: 4 → 2 (default 2 passes).
+    //   This fills gaps up to ~4 pixels wide — enough for genuine sensor noise
+    //   gaps without smearing object silhouettes. Pass-count tuning history:
+    //     8 passes, radius (voxDist+voxSize) — visibly shrank thin objects
+    //     4 passes, radius voxSize           — better, still some smoothing
+    //     2 passes, radius voxSize           — current. Silhouettes essentially
+    //                                          untouched.
     //
     //   Two textures (dilationA, dilationB) are used as ping-pong buffers so
     //   reads and writes don't conflict. After each pass they are swapped.
@@ -259,7 +264,7 @@ class MetalPipeline: @unchecked Sendable {
     // ─────────────────────────────────────────────────────────────────────────
     func dilateDepth(depthTexture: MTLTexture, frame: DepthFrame,
                      voxelSize: Float = 0.1, voxelDist: Float = 0.2,
-                     dilationSteps: Int = 8) -> MTLTexture {
+                     dilationSteps: Int = 2) -> MTLTexture {
         let w = depthTexture.width
         let h = depthTexture.height
 
@@ -284,7 +289,13 @@ class MetalPipeline: @unchecked Sendable {
         initEncoder.endEncoding()
 
         // ── Passes 1..dilationSteps: each one halves the step size ───────────
-        // maxStep = 2^dilationSteps (e.g. 8 steps → starts at 256)
+        // maxStep = 2^dilationSteps (e.g. 4 steps → starts at 16)
+        // We dispatch exactly `dilationSteps` passes — earlier this loop ran
+        // `0..<maxStep` times by mistake, which executed dilationSteps useful
+        // passes plus many extra no-op passes (with stepSize=0 after integer
+        // division). The no-ops were harmless but the off-by-one extra 1-pixel
+        // pass after the jump-flood schedule completed nibbled a pixel off
+        // every silhouette every frame.
         var maxStep = 1
         for _ in 0..<dilationSteps { maxStep *= 2 }
 
@@ -292,7 +303,7 @@ class MetalPipeline: @unchecked Sendable {
         var texA = dilationA!
         var texB = dilationB!
 
-        for _ in 0..<maxStep {
+        for _ in 0..<dilationSteps {
             var params = DilationParams(
                 proj: frame.proj[0],
                 texSize: SIMD2<UInt32>(UInt32(w), UInt32(h)),

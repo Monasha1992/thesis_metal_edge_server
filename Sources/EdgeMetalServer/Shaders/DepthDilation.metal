@@ -113,9 +113,14 @@ kernel void dilateDepthStep(
         // Used to determine how far (in pixels) we should allow filling
         float pixelSize = 2.0 * srcDepthLinear / (focalLength * float(params.texSize.x));
 
-        // Maximum fill radius in pixels — based on the TSDF band size
-        // Farther surfaces have larger pixels so the radius is bigger
-        float radius = (params.voxDist + params.voxSize) / pixelSize;
+        // Maximum fill radius in pixels — limited to one voxel-width.
+        // Earlier this was (voxDist + voxSize), which let a depth pixel borrow
+        // values from up to ~24 pixels away at typical room scales — wide
+        // enough that pillar/table-leg silhouettes were getting eroded by
+        // adjacent background depth bleeding into the noise gaps at their
+        // edges. One voxel-width is enough to fill genuine sensor holes
+        // without smearing silhouettes.
+        float radius = params.voxSize / pixelSize;
 
         // Distance (in pixels) from the neighbour's original source position to here
         float2 diff = srcVal.xy - float2(gid);

@@ -21,9 +21,10 @@ using namespace metal;
 //
 // HOW THE VOLUME IS STORED:
 //   A 3D texture with format RG32Float:
-//     R channel = TSDF value (the signed distance)
-//     G channel = weight (how many observations this voxel has received, max 30)
-//   Weight = 0 means this voxel has never been observed.
+//     R channel = TSDF value (the signed distance, freshly written every frame)
+//     G channel = weight, used only as an "observed / unobserved" flag
+//                 (0 = never seen, 1 = seen at least once)
+//   No temporal averaging — see the integrate kernel for the rationale.
 //
 // THIS FILE CONTAINS THREE KERNELS:
 //   1. clearVolume   — resets all voxels to unobserved (run once at start)
@@ -149,10 +150,15 @@ kernel void clearVolume(
 //   5. If the voxel is close enough to the surface (within truncation band):
 //      blend the new reading with the existing TSDF value using weighted average
 //
-// STABILITY TRICK (weighted running average):
-//   Each voxel keeps a weight (count of observations, capped at 30).
-//   New value = (old_value × old_weight + new_value) / new_weight
-//   This smooths out noise — more observations = more stable mesh.
+// NO TEMPORAL SMOOTHING:
+//   Each new observation directly overwrites the voxel's TSDF value. There
+//   is no running average, no weight accumulation, no carving. This was
+//   tried and reverted three times during development — every smoothing
+//   scheme caused noticeable lag on moved objects (10-15 s with the
+//   original cap=30, still seconds with carving + cap=3) and the
+//   responsiveness gained by removing it is more valuable than the small
+//   per-frame noise reduction it provided. Surface Nets' per-cell vertex
+//   placement still smooths the visible mesh slightly for free.
 //
 // QUALITY GATES (reasons a voxel update is rejected):
 //   - Voxel is too far from the surface (outside truncation band)
@@ -236,7 +242,21 @@ kernel void integrate(
 
     // Reject voxels where the surface normal is too edge-on (unreliable reading)
     // Exception: if this voxel is clearly empty space (far in front), always accept
-    bool validSurfaceNormal = empty || normDot > 0.3;
+    //
+    // Threshold tuning history:
+    //   0.3 (~73° cone) — visibly shrank curved/round objects. The curved
+    //                     sides of cylinders, pillars, table legs are at
+    //                     grazing angles from any single viewpoint, so most
+    //                     of their surface voxels were rejected and never
+    //                     made it into the mesh.
+    //   0.1 (~84° cone) — current. Keeps almost every observation. The
+    //                     `sDist *= saturate(normDot)` line above already
+    //                     scales grazing-angle observations down to their
+    //                     true perpendicular distance, so accepting them
+    //                     doesn't blur surfaces — it just stops discarding
+    //                     valid geometry. Drop to 0.0 to accept everything
+    //                     including pure edge-on rays (noisy, not recommended).
+    bool validSurfaceNormal = empty || normDot > 0.1;
 
     // ── Player exclusion cylinders ────────────────────────────────────────────
     // Skip voxels that fall inside a capped vertical cylinder around any player
@@ -269,22 +289,26 @@ kernel void integrate(
 
     // ── Update voxel if all quality gates pass ────────────────────────────────
     if (withinBand && unoccludedByDilation && validSurfaceNormal && outsidePlayers) {
-        float2 existing  = volume.read(uint3(coord)).rg;
-        float oldTsdf    = existing.r;
-        float oldWeight  = existing.g;
-
-        // Increment weight, capped at 30 to prevent old data from dominating forever
-        float newWeight = min(oldWeight + 1.0, 30.0);
-
-        // Weighted running average:
-        // First observation: just use the new value directly
-        // Subsequent observations: blend with existing value
-        float newTsdf = (oldWeight < 0.5)
-                        ? sDistNorm
-                        : (oldTsdf * oldWeight + sDistNorm) / newWeight;
-
-        // Write back: R = tsdf value, G = weight
-        volume.write(float4(newTsdf, newWeight, 0, 0), coord);
+        // ── Direct overwrite — no temporal smoothing ──────────────────────────
+        // Each new observation IS the new TSDF value. Maximally responsive:
+        // a chair that moves shows up correctly on the very next frame.
+        //
+        // History of this kernel:
+        //   no smoothing            → fast and responsive (this is where we are)
+        //   weighted avg, cap = 30  → very smooth, 10-15 s ghost on moved objects
+        //   cap 8 + tight carving   → smooth, still noticeably laggy
+        //   cap 3 + broad carving   → close but still felt slow
+        //
+        // Each smoothing scheme we tried fought the depth pipeline more than
+        // it helped. The depth pipeline's per-frame noise is small enough at
+        // this voxel size that the mesh looks acceptable without any temporal
+        // averaging — and Surface Nets' own per-cell vertex placement does a
+        // little spatial smoothing for free.
+        //
+        // Weight is fixed at 1.0 just to flag "this voxel has been observed"
+        // for downstream queries (extractNonEmpty / mesh extraction check
+        // weight > 0.5). It no longer participates in any blending.
+        volume.write(float4(sDistNorm, 1.0, 0, 0), coord);
     }
 }
 
