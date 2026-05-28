@@ -42,6 +42,13 @@ struct EdgeMetalServer {
         // Called every time a new Quest connects
         listener.newConnectionHandler = { connection in
             print("Client connected: \(connection.endpoint)")
+
+            // Open a fresh metrics CSV for this connection. The per-frame
+            // recorder appends rows to it as receivePayload processes each
+            // depth frame; the file is closed on process exit. See
+            // MetricsRecorder.swift for the format and join semantics.
+            MetricsRecorder.shared.startSession()
+
             connection.start(queue: .main)
             Self.receive(on: connection)
         }
@@ -189,6 +196,30 @@ struct EdgeMetalServer {
                 mesh=\(ms(t6,t7))ms | total=\(wallMs)ms \
                 → \(mesh.vertexCount)v \(mesh.triangleCount)t
                 """)
+
+                // ── Append a CSV row for the metrics-recorder ────────────────
+                // The Quest side stamps and echoes a uint64 timestamp; we use
+                // it as the join key when merging this Mac CSV with the
+                // Quest's `mesh` rows in pandas. Bytes-in/out include the
+                // 5-byte framing header on each direction (see [04-protocol]).
+                let responsePayloadBytes = 8 + 4 + 4
+                                         + (mesh.vertexCount * 24)
+                                         + (mesh.indices.count * 4)
+                MetricsRecorder.shared.record(
+                    timestampEchoMs:  frame.timestamp,
+                    parseMs:          t1.timeIntervalSince(wallStart) * 1000,
+                    uploadMs:         t2.timeIntervalSince(t1)        * 1000,
+                    dilateMs:         t3.timeIntervalSince(t2)        * 1000,
+                    normalsMs:        t4.timeIntervalSince(t3)        * 1000,
+                    setupMs:          t5.timeIntervalSince(t4)        * 1000,
+                    integrateMs:      t6.timeIntervalSince(t5)        * 1000,
+                    meshMs:           t7.timeIntervalSince(t6)        * 1000,
+                    totalMs:          t7.timeIntervalSince(wallStart) * 1000,
+                    vertCount:        mesh.vertexCount,
+                    triCount:         mesh.triangleCount,
+                    payloadInBytes:   accumulated.count + 5,
+                    responseOutBytes: 5 + responsePayloadBytes
+                )
 
                 // ── Serialize mesh and send back to Quest ─────────────────────
                 //
