@@ -11,6 +11,15 @@ let package = Package(
         // Targets can depend on other targets in this package and products from dependencies.
         .executableTarget(
             name: "EdgeMetalServer",
+            // Declaring the Shaders directory as a processed resource makes
+            // SwiftPM compile the .metal files into default.metallib inside
+            // the target's resource bundle AND synthesize `Bundle.module`,
+            // which MetalPipeline.swift needs for makeDefaultLibrary(bundle:).
+            // Without this, `swift build` fails with "Bundle has no member
+            // 'module'" (Xcode-based builds resolved it differently).
+            resources: [
+                .process("Shaders")
+            ],
             linkerSettings: [
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
