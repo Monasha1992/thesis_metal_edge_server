@@ -33,6 +33,24 @@ struct EdgeMetalServer {
     // Shared Metal GPU pipeline — created once, reused for every frame
     static let metal = MetalPipeline()
 
+    // ── Mesh-delivery mode ────────────────────────────────────────────────────
+    // true  → chunked meshing (0x04): the volume is meshed along a fixed grid
+    //         of 32³-voxel chunks; up to `maxChunksPerFrame` camera-near chunks
+    //         ship per response, each tagged with its grid coordinate. The
+    //         Quest caches chunks in a dictionary so previously-seen geometry
+    //         persists when the camera looks away (standalone-style).
+    // false → legacy single-mesh (0x03): one camera-centred region mesh that
+    //         the Quest replaces wholesale each round (no persistence).
+    //
+    // Both ends support both message types, so this flag is the only switch —
+    // useful as a thesis ablation (chunked persistence vs global replace).
+    static let useChunkedMeshing = true
+
+    // How many chunks to mesh + send per incoming depth frame. ~30 chunks are
+    // in range of a 6 m maxUpdateDist, so 8/frame refreshes every visible
+    // chunk roughly every 4 frames (~2.5 Hz per chunk at a 10 Hz send rate).
+    static let maxChunksPerFrame = 8
+
     static func main() {
         let port: UInt16 = 9876
 
@@ -179,9 +197,28 @@ struct EdgeMetalServer {
                 )
                 let t6 = Date()
 
-                // Step 8: Run Surface Nets to extract a triangle mesh from the TSDF volume.
-                //   Only meshes the region around the camera (not the full 128³ volume).
-                let mesh = metal.generateMesh(frame: frame)
+                // Step 8: Run Surface Nets to extract triangles from the TSDF volume.
+                //   Chunked mode: mesh up to maxChunksPerFrame grid chunks near the
+                //                 camera (round-robin through the in-range set).
+                //   Legacy mode:  one camera-centred region mesh.
+                let messageType: UInt8
+                let payload: Data
+                let totalVerts: Int
+                let totalTris:  Int
+
+                if useChunkedMeshing {
+                    let chunks = metal.generateChunkMeshes(frame: frame, budget: maxChunksPerFrame)
+                    messageType = 0x04
+                    payload     = serializeChunkBatch(chunks, timestamp: frame.timestamp)
+                    totalVerts  = chunks.reduce(0) { $0 + $1.mesh.vertexCount }
+                    totalTris   = chunks.reduce(0) { $0 + $1.mesh.triangleCount }
+                } else {
+                    let mesh = metal.generateMesh(frame: frame)
+                    messageType = 0x03
+                    payload     = serializeSingleMesh(mesh, timestamp: frame.timestamp)
+                    totalVerts  = mesh.vertexCount
+                    totalTris   = mesh.triangleCount
+                }
                 let t7 = Date()
 
                 // ── Per-step timing breakdown (printed for performance analysis) ──
@@ -194,7 +231,7 @@ struct EdgeMetalServer {
                 dilate=\(ms(t2,t3))ms normals=\(ms(t3,t4))ms \
                 setup=\(ms(t4,t5))ms integrate=\(ms(t5,t6))ms \
                 mesh=\(ms(t6,t7))ms | total=\(wallMs)ms \
-                → \(mesh.vertexCount)v \(mesh.triangleCount)t
+                → \(totalVerts)v \(totalTris)t
                 """)
 
                 // ── Append a CSV row for the metrics-recorder ────────────────
@@ -202,9 +239,6 @@ struct EdgeMetalServer {
                 // it as the join key when merging this Mac CSV with the
                 // Quest's `mesh` rows in pandas. Bytes-in/out include the
                 // 5-byte framing header on each direction (see [04-protocol]).
-                let responsePayloadBytes = 8 + 4 + 4
-                                         + (mesh.vertexCount * 24)
-                                         + (mesh.indices.count * 4)
                 MetricsRecorder.shared.record(
                     timestampEchoMs:  frame.timestamp,
                     parseMs:          t1.timeIntervalSince(wallStart) * 1000,
@@ -215,43 +249,16 @@ struct EdgeMetalServer {
                     integrateMs:      t6.timeIntervalSince(t5)        * 1000,
                     meshMs:           t7.timeIntervalSince(t6)        * 1000,
                     totalMs:          t7.timeIntervalSince(wallStart) * 1000,
-                    vertCount:        mesh.vertexCount,
-                    triCount:         mesh.triangleCount,
+                    vertCount:        totalVerts,
+                    triCount:         totalTris,
                     payloadInBytes:   accumulated.count + 5,
-                    responseOutBytes: 5 + responsePayloadBytes
+                    responseOutBytes: 5 + payload.count
                 )
 
-                // ── Serialize mesh and send back to Quest ─────────────────────
-                //
-                // Response payload layout:
-                //   8 bytes  — timestamp echo (uint64, same value received from Quest)
-                //   4 bytes  — vertex count (uint32)
-                //   4 bytes  — index count (uint32)
-                //   N×24 bytes — vertices: 6 floats each (pos.xyz + normal.xyz)
-                //   M×4 bytes  — triangle indices (uint32 each)
-                var payload = Data()
-
-                // Echo the original timestamp so the Quest can compute RTT
-                var ts = frame.timestamp
-                payload.append(Data(bytes: &ts, count: 8))
-
-                // Vertex and index counts
-                var vertCount = UInt32(mesh.vertexCount)
-                var idxCount  = UInt32(mesh.indices.count)
-                payload.append(Data(bytes: &vertCount, count: 4))
-                payload.append(Data(bytes: &idxCount, count: 4))
-
-                // Interleaved vertex data: position XYZ then normal XYZ (24 bytes per vertex)
-                var verts = mesh.vertices
-                payload.append(Data(bytes: &verts, count: verts.count * 4))
-
-                // Triangle indices — every 3 uint32 indices = one triangle
-                var indices = mesh.indices
-                payload.append(Data(bytes: &indices, count: indices.count * 4))
-
-                // 5-byte header: [type=0x03][payload length as big-endian uint32]
+                // ── Frame and send ────────────────────────────────────────────
+                // 5-byte header: [type][payload length as big-endian uint32]
                 var response = Data()
-                response.append(0x03)
+                response.append(messageType)
                 let len = UInt32(payload.count)
                 response.append(contentsOf: [
                     UInt8((len >> 24) & 0xFF),
@@ -269,5 +276,83 @@ struct EdgeMetalServer {
                 receive(on: connection)
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // serializeSingleMesh — Legacy 0x03 payload (one global mesh)
+    //
+    // Layout:
+    //   8 bytes    — timestamp echo (uint64, same value received from Quest)
+    //   4 bytes    — vertex count (uint32)
+    //   4 bytes    — index count (uint32)
+    //   N×24 bytes — vertices: 6 floats each (pos.xyz + normal.xyz)
+    //   M×4 bytes  — triangle indices (uint32 each)
+    // ─────────────────────────────────────────────────────────────────────────
+    static func serializeSingleMesh(_ mesh: MetalPipeline.MeshResult, timestamp: UInt64) -> Data {
+        var payload = Data()
+
+        var ts = timestamp
+        payload.append(Data(bytes: &ts, count: 8))
+
+        var vertCount = UInt32(mesh.vertexCount)
+        var idxCount  = UInt32(mesh.indices.count)
+        payload.append(Data(bytes: &vertCount, count: 4))
+        payload.append(Data(bytes: &idxCount, count: 4))
+
+        var verts = mesh.vertices
+        payload.append(Data(bytes: &verts, count: verts.count * 4))
+
+        var indices = mesh.indices
+        payload.append(Data(bytes: &indices, count: indices.count * 4))
+
+        return payload
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // serializeChunkBatch — 0x04 payload (persistent chunk cache protocol)
+    //
+    // Layout:
+    //   8 bytes  — timestamp echo (uint64, same value received from Quest)
+    //   4 bytes  — chunk count (uint32)
+    //   then per chunk:
+    //     12 bytes   — chunk grid coordinate (3 × int32)
+    //     4 bytes    — vertex count (uint32)
+    //     4 bytes    — index count (uint32)
+    //     N×24 bytes — vertices (pos.xyz + normal.xyz, float32 each)
+    //     M×4 bytes  — triangle indices (uint32, LOCAL to this chunk's vertices)
+    //
+    //   A chunk with vertexCount == 0 means "this grid cell is now empty" —
+    //   the Quest clears its cached mesh for that cell.
+    // ─────────────────────────────────────────────────────────────────────────
+    static func serializeChunkBatch(_ chunks: [MetalPipeline.ChunkMesh], timestamp: UInt64) -> Data {
+        var payload = Data()
+
+        var ts = timestamp
+        payload.append(Data(bytes: &ts, count: 8))
+
+        var count = UInt32(chunks.count)
+        payload.append(Data(bytes: &count, count: 4))
+
+        for chunk in chunks {
+            var cx = chunk.coord.x
+            var cy = chunk.coord.y
+            var cz = chunk.coord.z
+            payload.append(Data(bytes: &cx, count: 4))
+            payload.append(Data(bytes: &cy, count: 4))
+            payload.append(Data(bytes: &cz, count: 4))
+
+            var vertCount = UInt32(chunk.mesh.vertexCount)
+            var idxCount  = UInt32(chunk.mesh.indices.count)
+            payload.append(Data(bytes: &vertCount, count: 4))
+            payload.append(Data(bytes: &idxCount, count: 4))
+
+            var verts = chunk.mesh.vertices
+            payload.append(Data(bytes: &verts, count: verts.count * 4))
+
+            var indices = chunk.mesh.indices
+            payload.append(Data(bytes: &indices, count: indices.count * 4))
+        }
+
+        return payload
     }
 }

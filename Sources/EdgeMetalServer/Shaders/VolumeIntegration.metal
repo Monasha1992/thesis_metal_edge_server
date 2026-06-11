@@ -21,10 +21,11 @@ using namespace metal;
 //
 // HOW THE VOLUME IS STORED:
 //   A 3D texture with format RG32Float:
-//     R channel = TSDF value (the signed distance, freshly written every frame)
+//     R channel = TSDF value (updated every frame via a light 0.5 blend)
 //     G channel = weight, used only as an "observed / unobserved" flag
 //                 (0 = never seen, 1 = seen at least once)
-//   No temporal averaging — see the integrate kernel for the rationale.
+//   Temporal smoothing is a single-constant exponential blend (BLEND = 0.5
+//   in the integrate kernel) — see the kernel for the full tuning history.
 //
 // THIS FILE CONTAINS THREE KERNELS:
 //   1. clearVolume   — resets all voxels to unobserved (run once at start)
@@ -150,15 +151,14 @@ kernel void clearVolume(
 //   5. If the voxel is close enough to the surface (within truncation band):
 //      blend the new reading with the existing TSDF value using weighted average
 //
-// NO TEMPORAL SMOOTHING:
-//   Each new observation directly overwrites the voxel's TSDF value. There
-//   is no running average, no weight accumulation, no carving. This was
-//   tried and reverted three times during development — every smoothing
-//   scheme caused noticeable lag on moved objects (10-15 s with the
-//   original cap=30, still seconds with carving + cap=3) and the
-//   responsiveness gained by removing it is more valuable than the small
-//   per-frame noise reduction it provided. Surface Nets' per-cell vertex
-//   placement still smooths the visible mesh slightly for free.
+// TEMPORAL SMOOTHING (light 0.5 exponential blend):
+//   newTsdf = 0.5 × old + 0.5 × new. ~One frame of memory: per-frame depth
+//   noise halves every frame (no visible mesh "shake" during head motion),
+//   while a real scene change reaches ~90 % of its new value in 3-4 frames
+//   (~0.4 s). This sits between two rejected extremes that were both tested
+//   on-device: heavy weight-capped averaging (10-15 s ghosting on moved
+//   objects) and raw direct overwrite (responsive but visibly shimmering).
+//   See the integrate kernel's BLEND constant for the full tuning history.
 //
 // QUALITY GATES (reasons a voxel update is rejected):
 //   - Voxel is too far from the surface (outside truncation band)
@@ -289,26 +289,38 @@ kernel void integrate(
 
     // ── Update voxel if all quality gates pass ────────────────────────────────
     if (withinBand && unoccludedByDilation && validSurfaceNormal && outsidePlayers) {
-        // ── Direct overwrite — no temporal smoothing ──────────────────────────
-        // Each new observation IS the new TSDF value. Maximally responsive:
-        // a chair that moves shows up correctly on the very next frame.
+        // ── Light exponential blend (anti-shake) ──────────────────────────────
+        // newTsdf = BLEND × old + (1 − BLEND) × new.
+        // At 0.5 this has ~one frame of memory: per-frame depth noise halves
+        // every frame (the visible mesh stops "shaking" while the head moves),
+        // while a real scene change still reaches ~90 % of its new value in
+        // 3-4 frames (~0.4 s at 8 Hz) — nothing like the multi-second
+        // ghosting of the old weight-capped running average.
         //
-        // History of this kernel:
-        //   no smoothing            → fast and responsive (this is where we are)
+        // History of this kernel (each stage tested on-device):
         //   weighted avg, cap = 30  → very smooth, 10-15 s ghost on moved objects
         //   cap 8 + tight carving   → smooth, still noticeably laggy
         //   cap 3 + broad carving   → close but still felt slow
+        //   direct overwrite        → maximally responsive, but per-frame noise
+        //                             made the whole mesh visibly shake/shimmer,
+        //                             worst while the head was moving
+        //   0.5 blend (current)     → kills the shimmer, keeps ~0.4 s response
         //
-        // Each smoothing scheme we tried fought the depth pipeline more than
-        // it helped. The depth pipeline's per-frame noise is small enough at
-        // this voxel size that the mesh looks acceptable without any temporal
-        // averaging — and Surface Nets' own per-cell vertex placement does a
-        // little spatial smoothing for free.
+        // Tuning: raise BLEND toward 0.7 for more smoothing (slower response),
+        // lower toward 0.0 for the raw direct-overwrite behaviour.
         //
-        // Weight is fixed at 1.0 just to flag "this voxel has been observed"
-        // for downstream queries (extractNonEmpty / mesh extraction check
-        // weight > 0.5). It no longer participates in any blending.
-        volume.write(float4(sDistNorm, 1.0, 0, 0), coord);
+        // Weight (G channel) stays a pure "has this voxel ever been observed"
+        // flag: 0 = never, 1 = yes. First observation skips the blend so a
+        // fresh voxel snaps straight to its measured value instead of blending
+        // with the unobserved-sentinel 0.
+        const float BLEND = 0.5;
+
+        float2 old = volume.read(uint3(coord)).rg;
+        float newTsdf = (old.g < 0.5)
+                        ? sDistNorm
+                        : mix(sDistNorm, old.r, BLEND);
+
+        volume.write(float4(newTsdf, 1.0, 0, 0), coord);
     }
 }
 

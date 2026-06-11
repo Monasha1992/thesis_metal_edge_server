@@ -818,10 +818,43 @@ class MetalPipeline: @unchecked Sendable {
 
     // ── coordVertMap buffer ────────────────────────────────────────────────────
     // Shared between the two Surface Nets passes:
-    //   Pass 1 writes: voxel index → vertex index (-1 if no vertex)
+    //   Pass 1 writes: REGION-RELATIVE cell index → vertex index (-1 if none)
     //   Pass 2 reads:  looks up the 4 surrounding vertices to form a quad
-    // Reused across frames to avoid reallocating the large buffer every time.
+    // Region-relative indexing (see SurfaceNets.metal header) keeps this buffer
+    // small: a 34³ chunk region needs ~157 KB; the legacy camera-box region
+    // ~7 MB — versus ~1 GB if it were indexed by absolute volume coordinates.
+    // Grow-only and reused across calls.
     var coordVertMapBuffer: MTLBuffer?
+
+    // ── Pooled mesh output buffers ────────────────────────────────────────────
+    // Grow-only, shared by every meshRegion call (legacy camera-box path and
+    // per-chunk path alike). Per-chunk meshing runs up to `maxChunksPerFrame`
+    // dispatches per incoming frame — allocating fresh MTLBuffers for each
+    // would add measurable per-frame overhead.
+    private var meshVertexBuffer: MTLBuffer?
+    private var meshTriBuffer:    MTLBuffer?
+    private var meshVertCountBuffer: MTLBuffer?
+    private var meshTriCountBuffer:  MTLBuffer?
+
+    // ── Chunk grid for persistent client-side caching ─────────────────────────
+    // The volume is divided into fixed 32³-voxel chunks (3.2 m at 0.1 m voxels).
+    // generateChunkMeshes() meshes a budgeted number of camera-near chunks per
+    // frame and returns them tagged with their grid coordinate; the Quest keeps
+    // a chunk dictionary and replaces only the cells that arrive — geometry
+    // outside the current view persists on the client (standalone-style), and
+    // the server stays stateless beyond the TSDF volume it already owns.
+    let chunkSizeVox: Int32 = 32
+
+    // Round-robin work queue of in-view chunk coords. Refilled (nearest-first)
+    // whenever it runs empty, so all visible chunks refresh within a few frames
+    // even though only `budget` are meshed per incoming depth frame.
+    private var chunkQueue: [SIMD3<Int32>] = []
+
+    /// One meshed chunk: its grid coordinate plus the extracted triangles.
+    struct ChunkMesh {
+        let coord: SIMD3<Int32>
+        let mesh:  MeshResult
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // generateMesh — Runs Surface Nets to extract a triangle mesh from the TSDF volume
@@ -849,79 +882,212 @@ class MetalPipeline: @unchecked Sendable {
     //   regionMin/Max = eyeVox ± extentVox, clamped to volume bounds
     // ─────────────────────────────────────────────────────────────────────────
     func generateMesh(frame: DepthFrame) -> MeshResult {
-        guard let volume = volumeTexture else {
+        guard volumeTexture != nil else {
             return MeshResult(vertices: [], indices: [], vertexCount: 0, triangleCount: 0)
         }
 
         let voxCount = SIMD3<Int32>(frame.voxelCount.x, frame.voxelCount.y, frame.voxelCount.z)
-        let totalVoxels = Int(voxCount.x) * Int(voxCount.y) * Int(voxCount.z)
 
         // ── Camera-centred bounding box ───────────────────────────────────────
         // Extract camera world position from the 4th column of the inverse view matrix
         // (viewInv transforms camera → world, so its translation column = world eye pos)
-        let eyeCol   = frame.viewInv[0][3]
-        let eyeWorld = SIMD3<Float>(eyeCol.x, eyeCol.y, eyeCol.z)
-
-        // Convert camera world position to voxel grid coordinates
-        // Formula: (world_pos / voxelSize) + (voxelCount / 2)  — volume is centred at origin
+        let eyeWorld  = cameraWorldPosition(frame: frame)
         let extentVox = Int32(frame.maxUpdateDist / frame.voxelSize) + 2
-        let eyeVox = SIMD3<Int32>(
-            Int32(eyeWorld.x / frame.voxelSize + Float(voxCount.x) * 0.5),
-            Int32(eyeWorld.y / frame.voxelSize + Float(voxCount.y) * 0.5),
-            Int32(eyeWorld.z / frame.voxelSize + Float(voxCount.z) * 0.5)
-        )
+        let eyeVox    = worldToVoxel(eyeWorld, voxCount: voxCount, voxelSize: frame.voxelSize)
 
         // Mesh only the cube around the camera, clamped to volume bounds
-        let regionMin   = max(eyeVox &- extentVox, SIMD3<Int32>(0, 0, 0))
-        let regionMax   = min(eyeVox &+ extentVox, voxCount)
+        let regionMin = max(eyeVox &- extentVox, SIMD3<Int32>(0, 0, 0))
+        let regionMax = min(eyeVox &+ extentVox, voxCount)
+
+        return meshRegion(regionMin: regionMin, regionMax: regionMax,
+                          voxCount: voxCount, voxelSize: frame.voxelSize)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // generateChunkMeshes — Per-chunk meshing for the persistent client cache
+    //
+    // Returns up to `budget` chunk meshes per call. Selection:
+    //   1. When the work queue is empty, refill it with every chunk whose
+    //      centre lies within (maxUpdateDist + chunk radius) of the camera,
+    //      sorted nearest-first.
+    //   2. Pop `budget` chunks off the queue and mesh each one.
+    //
+    // The rotation means all in-range chunks refresh within a few frames
+    // (~30 in-range chunks / 8 per frame ≈ full refresh every 4 frames
+    // ≈ each chunk at ~2.5 Hz with a 10 Hz send rate) while per-frame server
+    // time stays bounded.
+    //
+    // Empty results (vertexCount == 0) ARE returned — the client interprets
+    // them as "clear this chunk" so removed geometry disappears.
+    //
+    // Each chunk's mesh region is expanded by 1 cell on every side. Border
+    // cells get meshed by both neighbouring chunks; the duplicated seam
+    // triangles are bit-identical (same TSDF inputs, same math), so they
+    // render coincident with no z-fighting — this is what makes chunk
+    // borders crack-free without any cross-chunk stitching.
+    // ─────────────────────────────────────────────────────────────────────────
+    func generateChunkMeshes(frame: DepthFrame, budget: Int) -> [ChunkMesh] {
+        guard volumeTexture != nil else { return [] }
+
+        let voxCount = SIMD3<Int32>(frame.voxelCount.x, frame.voxelCount.y, frame.voxelCount.z)
+
+        // ── Refill the round-robin queue when exhausted ───────────────────────
+        if chunkQueue.isEmpty {
+            chunkQueue = inRangeChunks(frame: frame, voxCount: voxCount)
+        }
+
+        // ── Mesh up to `budget` chunks from the queue front ───────────────────
+        var out: [ChunkMesh] = []
+        while out.count < budget, !chunkQueue.isEmpty {
+            let c = chunkQueue.removeFirst()
+
+            // Chunk voxel region, expanded 1 cell each side for seam overlap
+            let base      = c &* chunkSizeVox
+            let regionMin = max(base &- 1, SIMD3<Int32>(0, 0, 0))
+            let regionMax = min(base &+ chunkSizeVox &+ 1, voxCount)
+
+            let mesh = meshRegion(regionMin: regionMin, regionMax: regionMax,
+                                  voxCount: voxCount, voxelSize: frame.voxelSize)
+            out.append(ChunkMesh(coord: c, mesh: mesh))
+        }
+        return out
+    }
+
+    // Collects every chunk coordinate whose centre is within
+    // (maxUpdateDist + half the chunk diagonal) of the camera, nearest first.
+    private func inRangeChunks(frame: DepthFrame, voxCount: SIMD3<Int32>) -> [SIMD3<Int32>] {
+        let eyeWorld  = cameraWorldPosition(frame: frame)
+        let chunkSizeWorld = Float(chunkSizeVox) * frame.voxelSize          // e.g. 3.2 m
+        let chunkRadius    = chunkSizeWorld * 0.866                          // half diagonal
+        let reach          = frame.maxUpdateDist + chunkRadius
+
+        // Chunk-grid dimensions (volume voxels / chunk size, rounded up)
+        let gridDims = SIMD3<Int32>(
+            (voxCount.x + chunkSizeVox - 1) / chunkSizeVox,
+            (voxCount.y + chunkSizeVox - 1) / chunkSizeVox,
+            (voxCount.z + chunkSizeVox - 1) / chunkSizeVox
+        )
+
+        // Candidate chunk-index AABB around the camera (clamped to the grid)
+        let half = SIMD3<Float>(Float(voxCount.x), Float(voxCount.y), Float(voxCount.z)) * 0.5
+        func chunkIndex(_ w: Float, _ halfAxis: Float) -> Int32 {
+            Int32(floor((w / frame.voxelSize + halfAxis) / Float(chunkSizeVox)))
+        }
+        let loX = max(chunkIndex(eyeWorld.x - reach, half.x), 0)
+        let hiX = min(chunkIndex(eyeWorld.x + reach, half.x), gridDims.x - 1)
+        let loY = max(chunkIndex(eyeWorld.y - reach, half.y), 0)
+        let hiY = min(chunkIndex(eyeWorld.y + reach, half.y), gridDims.y - 1)
+        let loZ = max(chunkIndex(eyeWorld.z - reach, half.z), 0)
+        let hiZ = min(chunkIndex(eyeWorld.z + reach, half.z), gridDims.z - 1)
+        guard loX <= hiX, loY <= hiY, loZ <= hiZ else { return [] }
+
+        // Gather chunks whose centre is actually within reach (sphere test
+        // tightens the AABB corner chunks away — ~half the candidate count)
+        var found: [(SIMD3<Int32>, Float)] = []
+        for cz in loZ...hiZ {
+            for cy in loY...hiY {
+                for cx in loX...hiX {
+                    let coord  = SIMD3<Int32>(cx, cy, cz)
+                    let centreVox = SIMD3<Float>(
+                        (Float(cx) + 0.5) * Float(chunkSizeVox),
+                        (Float(cy) + 0.5) * Float(chunkSizeVox),
+                        (Float(cz) + 0.5) * Float(chunkSizeVox)
+                    )
+                    let centreWorld = (centreVox - half) * frame.voxelSize
+                    let dist = simd_distance(centreWorld, eyeWorld)
+                    if dist <= reach {
+                        found.append((coord, dist))
+                    }
+                }
+            }
+        }
+        found.sort { $0.1 < $1.1 }     // nearest first
+        return found.map { $0.0 }
+    }
+
+    // Camera world position from the 4th column of the left-eye inverse view matrix.
+    private func cameraWorldPosition(frame: DepthFrame) -> SIMD3<Float> {
+        let eyeCol = frame.viewInv[0][3]
+        return SIMD3<Float>(eyeCol.x, eyeCol.y, eyeCol.z)
+    }
+
+    // World position → voxel grid coordinate (volume centred on world origin).
+    private func worldToVoxel(_ w: SIMD3<Float>, voxCount: SIMD3<Int32>, voxelSize: Float) -> SIMD3<Int32> {
+        SIMD3<Int32>(
+            Int32(w.x / voxelSize + Float(voxCount.x) * 0.5),
+            Int32(w.y / voxelSize + Float(voxCount.y) * 0.5),
+            Int32(w.z / voxelSize + Float(voxCount.z) * 0.5)
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // meshRegion — Shared Surface Nets core: extracts triangles from one
+    // axis-aligned voxel region. Used by both the legacy camera-box path
+    // (generateMesh) and the per-chunk path (generateChunkMeshes).
+    //
+    // All scratch buffers are pooled grow-only members so repeated per-chunk
+    // calls don't allocate. The coordVertMap is REGION-RELATIVE (matching
+    // SurfaceNets.metal), so only regionTotal × 4 bytes are cleared per call —
+    // ~157 KB for a chunk instead of ~1 GB for a full-volume map.
+    // ─────────────────────────────────────────────────────────────────────────
+    private func meshRegion(
+        regionMin: SIMD3<Int32>, regionMax: SIMD3<Int32>,
+        voxCount: SIMD3<Int32>, voxelSize: Float
+    ) -> MeshResult {
+        guard let volume = volumeTexture else {
+            return MeshResult(vertices: [], indices: [], vertexCount: 0, triangleCount: 0)
+        }
+
         let regionSize  = regionMax &- regionMin
         let regionTotal = Int(regionSize.x) * Int(regionSize.y) * Int(regionSize.z)
-        print("Mesh region: \(regionMin) to \(regionMax), size \(regionSize), total \(regionTotal)")
+        guard regionTotal > 0 else {
+            return MeshResult(vertices: [], indices: [], vertexCount: 0, triangleCount: 0)
+        }
 
-        // Buffer size estimates based on the region (not full volume)
-        // maxVertices: at most 1 vertex per 3 voxels (heuristic)
-        // maxTriIndices: at most 6 indices (2 triangles) per voxel per axis = 18 per voxel,
-        //                but only a fraction of voxels are on the surface, so 6× is safe
-        let maxVertices   = regionTotal / 3
+        // Buffer size estimates based on the region:
+        //   maxVertices: at most 1 vertex per 3 cells (heuristic)
+        //   maxTriIndices: 6 indices per cell is a safe surface-fraction bound
+        let maxVertices   = max(regionTotal / 3, 1)
         let maxTriIndices = regionTotal * 6
 
-        // ── coordVertMap: voxel-to-vertex lookup table ────────────────────────
-        // Size = totalVoxels (full volume) because indices use absolute voxel coords
-        // Initialise to 0xFF (all bytes) = -1 (0xFFFFFFFF as int32 = INVALID_VERTEX)
-        if coordVertMapBuffer == nil || coordVertMapBuffer!.length < totalVoxels * 4 {
-            coordVertMapBuffer = device.makeBuffer(length: totalVoxels * 4, options: .storageModeShared)!
+        // ── (Re)size pooled buffers, grow-only ────────────────────────────────
+        if coordVertMapBuffer == nil || coordVertMapBuffer!.length < regionTotal * 4 {
+            coordVertMapBuffer = device.makeBuffer(length: regionTotal * 4, options: .storageModeShared)!
         }
-        memset(coordVertMapBuffer!.contents(), 0xFF, totalVoxels * 4)
+        if meshVertexBuffer == nil || meshVertexBuffer!.length < maxVertices * 24 {
+            meshVertexBuffer = device.makeBuffer(length: maxVertices * 24, options: .storageModeShared)!
+        }
+        if meshTriBuffer == nil || meshTriBuffer!.length < maxTriIndices * 4 {
+            meshTriBuffer = device.makeBuffer(length: maxTriIndices * 4, options: .storageModeShared)!
+        }
+        if meshVertCountBuffer == nil {
+            meshVertCountBuffer = device.makeBuffer(length: 4, options: .storageModeShared)!
+            meshTriCountBuffer  = device.makeBuffer(length: 4, options: .storageModeShared)!
+        }
 
-        // ── Output buffers ────────────────────────────────────────────────────
-        // vertexBuffer: 24 bytes per vertex (packed_float3 pos + packed_float3 norm)
-        let vertexBuffer  = device.makeBuffer(length: max(maxVertices * 24, 24), options: .storageModeShared)!
-        let vertCountBuffer = device.makeBuffer(length: 4, options: .storageModeShared)!
-        let triBuffer     = device.makeBuffer(length: max(maxTriIndices * 4, 4), options: .storageModeShared)!
-        let triCountBuffer  = device.makeBuffer(length: 4, options: .storageModeShared)!
+        // Clear the region's map cells to INVALID_VERTEX (-1 = 0xFFFFFFFF)
+        memset(coordVertMapBuffer!.contents(), 0xFF, regionTotal * 4)
 
-        // Zero-initialise the atomic counters
-        vertCountBuffer.contents().storeBytes(of: Int32(0), as: Int32.self)
-        triCountBuffer.contents().storeBytes(of: Int32(0), as: Int32.self)
+        // Zero the atomic counters
+        meshVertCountBuffer!.contents().storeBytes(of: Int32(0), as: Int32.self)
+        meshTriCountBuffer!.contents().storeBytes(of: Int32(0), as: Int32.self)
 
         var params = MeshParams(
             voxCount:  voxCount,
-            voxSize:   frame.voxelSize,
+            voxSize:   voxelSize,
             regionMin: regionMin,
             regionMax: regionMax
         )
-        print("MeshParams size: \(MemoryLayout<MeshParams>.size), stride: \(MemoryLayout<MeshParams>.stride)")
 
         let commandBuffer = commandQueue.makeCommandBuffer()!
 
         // ── Pass 1: Generate vertices ─────────────────────────────────────────
-        // One thread per voxel cell in the meshing region
         let vertEncoder = commandBuffer.makeComputeCommandEncoder()!
         vertEncoder.setComputePipelineState(vertexPipeline)
-        vertEncoder.setTexture(volume,                index: 0)  // TSDF volume (read-only)
-        vertEncoder.setBuffer(vertexBuffer,           offset: 0, index: 0)  // Output: vertices
-        vertEncoder.setBuffer(vertCountBuffer,        offset: 0, index: 1)  // Atomic vertex counter
-        vertEncoder.setBuffer(coordVertMapBuffer!,    offset: 0, index: 2)  // voxel → vertex map
+        vertEncoder.setTexture(volume,                  index: 0)
+        vertEncoder.setBuffer(meshVertexBuffer!,        offset: 0, index: 0)
+        vertEncoder.setBuffer(meshVertCountBuffer!,     offset: 0, index: 1)
+        vertEncoder.setBuffer(coordVertMapBuffer!,      offset: 0, index: 2)
         vertEncoder.setBytes(&params, length: MemoryLayout<MeshParams>.size, index: 3)
 
         let w1 = vertexPipeline.threadExecutionWidth
@@ -932,16 +1098,14 @@ class MetalPipeline: @unchecked Sendable {
         vertEncoder.endEncoding()
 
         // ── Pass 2: Generate triangle indices ─────────────────────────────────
-        // One thread per voxel cell in the meshing region
-        // Reads coordVertMap (written by Pass 1) to find neighbouring vertices
         let idxEncoder = commandBuffer.makeComputeCommandEncoder()!
         idxEncoder.setComputePipelineState(indexPipeline)
-        idxEncoder.setTexture(volume,             index: 0)  // TSDF volume (for crossing checks)
-        idxEncoder.setBuffer(coordVertMapBuffer!, offset: 0, index: 0)  // voxel → vertex map
-        idxEncoder.setBuffer(triBuffer,           offset: 0, index: 1)  // Output: triangle indices
-        idxEncoder.setBuffer(triCountBuffer,      offset: 0, index: 2)  // Atomic triangle counter
+        idxEncoder.setTexture(volume,               index: 0)
+        idxEncoder.setBuffer(coordVertMapBuffer!,   offset: 0, index: 0)
+        idxEncoder.setBuffer(meshTriBuffer!,        offset: 0, index: 1)
+        idxEncoder.setBuffer(meshTriCountBuffer!,   offset: 0, index: 2)
         idxEncoder.setBytes(&params, length: MemoryLayout<MeshParams>.size, index: 3)
-        idxEncoder.setBuffer(vertexBuffer,        offset: 0, index: 4)  // Vertices (not written to here)
+        idxEncoder.setBuffer(meshVertexBuffer!,     offset: 0, index: 4)
 
         let w2 = indexPipeline.threadExecutionWidth
         idxEncoder.dispatchThreads(
@@ -955,16 +1119,13 @@ class MetalPipeline: @unchecked Sendable {
         commandBuffer.waitUntilCompleted()
 
         // ── Read results back to CPU ──────────────────────────────────────────
-        let vertCount = Int(vertCountBuffer.contents().load(as: Int32.self))
-        // Clamp triangle count to buffer capacity (safety guard against overflow)
-        let triCount  = min(Int(triCountBuffer.contents().load(as: Int32.self)), maxTriIndices)
+        let vertCount = min(Int(meshVertCountBuffer!.contents().load(as: Int32.self)), maxVertices)
+        let triCount  = min(Int(meshTriCountBuffer!.contents().load(as: Int32.self)), maxTriIndices)
 
-        // Read float data: 6 floats per vertex (pos.xyz, norm.xyz)
-        let vertPtr = vertexBuffer.contents().bindMemory(to: Float.self, capacity: vertCount * 6)
+        let vertPtr = meshVertexBuffer!.contents().bindMemory(to: Float.self, capacity: vertCount * 6)
         let verts   = Array(UnsafeBufferPointer(start: vertPtr, count: vertCount * 6))
 
-        // Read index data: one UInt32 per index, 3 indices per triangle
-        let idxPtr  = triBuffer.contents().bindMemory(to: UInt32.self, capacity: triCount)
+        let idxPtr  = meshTriBuffer!.contents().bindMemory(to: UInt32.self, capacity: triCount)
         let indices = Array(UnsafeBufferPointer(start: idxPtr, count: triCount))
 
         return MeshResult(

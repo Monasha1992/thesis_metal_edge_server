@@ -23,7 +23,18 @@ using namespace metal;
 // TWO-PASS APPROACH:
 //   Pass 1 (surfaceNetsVertices): For each voxel cell, check if it contains
 //     a surface crossing. If so, compute a vertex position and store it.
-//     Also write to coordVertMap: a lookup table of (voxel index → vertex index).
+//     Also write to coordVertMap: a lookup table of (cell → vertex index).
+//
+// COORDVERTMAP IS REGION-RELATIVE:
+//   The map is indexed by LOCAL cell coordinates within [regionMin, regionMax),
+//   sized regionSize.x*y*z — NOT by absolute volume coordinates. This keeps the
+//   buffer small (a 34³ chunk region needs ~157 KB instead of a full-volume
+//   1024×256×1024 map needing ~1 GB) so per-chunk meshing can clear and reuse
+//   it cheaply. Both passes use the same region so the indexing is consistent.
+//   A neighbour lookup that would fall outside the region is treated as
+//   INVALID_VERTEX — the adjacent chunk emits those seam quads instead (chunk
+//   regions overlap by one cell, so every seam quad is emitted by exactly the
+//   dispatches whose region fully contains its four cells).
 //
 //   Pass 2 (surfaceNetsIndices): For each voxel cell that has a vertex,
 //     look at its 3 axis-aligned neighbours. If there's a surface crossing
@@ -125,7 +136,7 @@ kernel void surfaceNetsVertices(
     if (coord.x >= voxCount.x - 1 ||
         coord.y >= voxCount.y - 1 ||
         coord.z >= voxCount.z - 1) {
-        coordVertMap[flattenCoord(coord, voxCount)] = INVALID_VERTEX;
+        coordVertMap[flattenCoord(localCoord, regionSize)] = INVALID_VERTEX;
         return;
     }
 
@@ -162,7 +173,7 @@ kernel void surfaceNetsVertices(
     // Require at least 3 crossings — fewer means this is a noisy or corner voxel
     // that wouldn't produce a good-looking surface
     if (numCrossings < 3) {
-        coordVertMap[flattenCoord(coord, voxCount)] = INVALID_VERTEX;
+        coordVertMap[flattenCoord(localCoord, regionSize)] = INVALID_VERTEX;
         return;
     }
 
@@ -178,8 +189,8 @@ kernel void surfaceNetsVertices(
     int vertIdx = atomic_fetch_add_explicit(vertexCounter, 1, memory_order_relaxed);
     vertices[vertIdx] = Vertex { pos, norm };
 
-    // Record this voxel's vertex index so Pass 2 can look it up
-    coordVertMap[flattenCoord(coord, voxCount)] = vertIdx;
+    // Record this cell's vertex index (region-relative) so Pass 2 can look it up
+    coordVertMap[flattenCoord(localCoord, regionSize)] = vertIdx;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,8 +220,9 @@ kernel void surfaceNetsIndices(
     int3 localCoord = unflattenCoord(int(tid), regionSize);
     int3 coord = localCoord + params.regionMin;
 
-    // This voxel must have a vertex (from Pass 1) to emit any triangles
-    int vertA = coordVertMap[flattenCoord(coord, voxCount)];
+    // This voxel must have a vertex (from Pass 1) to emit any triangles.
+    // Map lookups are region-relative (see header comment).
+    int vertA = coordVertMap[flattenCoord(localCoord, regionSize)];
     if (vertA == INVALID_VERTEX) return;
 
     // Check all 3 axis-aligned directions for surface crossings
@@ -224,8 +236,11 @@ kernel void surfaceNetsIndices(
         int3 d1   = d1s[ax];
         int3 d2   = d2s[ax];
 
-        // We need neighbours at coord-d1 and coord-d2 — skip if at volume edge
-        if (any(coord - d1 < 0) || any(coord - d2 < 0)) continue;
+        // We need neighbours at -d1 and -d2 — skip if that would step outside
+        // the meshing REGION (covers the volume edge too, since the map is
+        // region-relative and the neighbouring chunk emits the seam quads
+        // its own region fully contains).
+        if (any(localCoord - d1 < 0) || any(localCoord - d2 < 0)) continue;
 
         // Check if there's a surface crossing along this axis
         float valA = readVolume(volume, coord,        voxCount);
@@ -240,9 +255,9 @@ kernel void surfaceNetsIndices(
         //   c = one step back in both d1 and d2
         //   d = one step back in d2 direction
         int a = vertA;
-        int b = coordVertMap[flattenCoord(coord - d1,        voxCount)];
-        int c = coordVertMap[flattenCoord(coord - (d1 + d2), voxCount)];
-        int d = coordVertMap[flattenCoord(coord - d2,        voxCount)];
+        int b = coordVertMap[flattenCoord(localCoord - d1,        regionSize)];
+        int c = coordVertMap[flattenCoord(localCoord - (d1 + d2), regionSize)];
+        int d = coordVertMap[flattenCoord(localCoord - d2,        regionSize)];
 
         // All 4 corners must have vertices — skip if any are missing
         if (b == INVALID_VERTEX || c == INVALID_VERTEX || d == INVALID_VERTEX) continue;
