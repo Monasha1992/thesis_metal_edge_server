@@ -206,20 +206,38 @@ struct EdgeMetalServer {
                 let totalVerts: Int
                 let totalTris:  Int
 
+                let chunks: [MetalPipeline.ChunkMesh]
+                let singleMesh: MetalPipeline.MeshResult?
+
                 if useChunkedMeshing {
-                    let chunks = metal.generateChunkMeshes(frame: frame, budget: maxChunksPerFrame)
+                    chunks     = metal.generateChunkMeshes(frame: frame, budget: maxChunksPerFrame)
+                    singleMesh = nil
+                } else {
+                    chunks     = []
+                    singleMesh = metal.generateMesh(frame: frame)
+                }
+                let t7 = Date()
+
+                if useChunkedMeshing {
                     messageType = 0x04
-                    payload     = serializeChunkBatch(chunks, timestamp: frame.timestamp)
+                    payload     = serializeChunkBatch(chunks, timestamp: frame.timestamp,
+                                                      totalMs: Float(t7.timeIntervalSince(wallStart) * 1000),
+                                                      parseMs: Float(t1.timeIntervalSince(wallStart) * 1000),
+                                                      integrateMs: Float(t6.timeIntervalSince(t5) * 1000),
+                                                      meshMs: Float(t7.timeIntervalSince(t6) * 1000))
                     totalVerts  = chunks.reduce(0) { $0 + $1.mesh.vertexCount }
                     totalTris   = chunks.reduce(0) { $0 + $1.mesh.triangleCount }
                 } else {
-                    let mesh = metal.generateMesh(frame: frame)
+                    let mesh    = singleMesh!
                     messageType = 0x03
-                    payload     = serializeSingleMesh(mesh, timestamp: frame.timestamp)
+                    payload     = serializeSingleMesh(mesh, timestamp: frame.timestamp,
+                                                      totalMs: Float(t7.timeIntervalSince(wallStart) * 1000),
+                                                      parseMs: Float(t1.timeIntervalSince(wallStart) * 1000),
+                                                      integrateMs: Float(t6.timeIntervalSince(t5) * 1000),
+                                                      meshMs: Float(t7.timeIntervalSince(t6) * 1000))
                     totalVerts  = mesh.vertexCount
                     totalTris   = mesh.triangleCount
                 }
-                let t7 = Date()
 
                 // ── Per-step timing breakdown (printed for performance analysis) ──
                 func ms(_ a: Date, _ b: Date) -> String {
@@ -288,11 +306,16 @@ struct EdgeMetalServer {
     //   N×24 bytes — vertices: 6 floats each (pos.xyz + normal.xyz)
     //   M×4 bytes  — triangle indices (uint32 each)
     // ─────────────────────────────────────────────────────────────────────────
-    static func serializeSingleMesh(_ mesh: MetalPipeline.MeshResult, timestamp: UInt64) -> Data {
+    static func serializeSingleMesh(_ mesh: MetalPipeline.MeshResult, timestamp: UInt64, totalMs: Float, parseMs: Float, integrateMs: Float, meshMs: Float) -> Data {
         var payload = Data()
 
         var ts = timestamp
         payload.append(Data(bytes: &ts, count: 8))
+
+        var t0 = totalMs;     payload.append(Data(bytes: &t0, count: 4))
+        var t1 = parseMs;     payload.append(Data(bytes: &t1, count: 4))
+        var t2 = integrateMs; payload.append(Data(bytes: &t2, count: 4))
+        var t3 = meshMs;      payload.append(Data(bytes: &t3, count: 4))
 
         var vertCount = UInt32(mesh.vertexCount)
         var idxCount  = UInt32(mesh.indices.count)
@@ -324,11 +347,16 @@ struct EdgeMetalServer {
     //   A chunk with vertexCount == 0 means "this grid cell is now empty" —
     //   the Quest clears its cached mesh for that cell.
     // ─────────────────────────────────────────────────────────────────────────
-    static func serializeChunkBatch(_ chunks: [MetalPipeline.ChunkMesh], timestamp: UInt64) -> Data {
+    static func serializeChunkBatch(_ chunks: [MetalPipeline.ChunkMesh], timestamp: UInt64, totalMs: Float, parseMs: Float, integrateMs: Float, meshMs: Float) -> Data {
         var payload = Data()
 
         var ts = timestamp
         payload.append(Data(bytes: &ts, count: 8))
+
+        var t0 = totalMs;     payload.append(Data(bytes: &t0, count: 4))
+        var t1 = parseMs;     payload.append(Data(bytes: &t1, count: 4))
+        var t2 = integrateMs; payload.append(Data(bytes: &t2, count: 4))
+        var t3 = meshMs;      payload.append(Data(bytes: &t3, count: 4))
 
         var count = UInt32(chunks.count)
         payload.append(Data(bytes: &count, count: 4))

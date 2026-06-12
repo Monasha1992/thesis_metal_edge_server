@@ -18,7 +18,11 @@ let package = Package(
             // Without this, `swift build` fails with "Bundle has no member
             // 'module'" (Xcode-based builds resolved it differently).
             resources: [
-                .process("Shaders")
+                .process("Shaders/DepthDilation.metal"),
+                .process("Shaders/DepthNormal.metal"),
+                .process("Shaders/DepthProcess.metal"),
+                .process("Shaders/SurfaceNets.metal"),
+                .process("Shaders/VolumeIntegration.metal")
             ],
             linkerSettings: [
                 .linkedFramework("Metal"),

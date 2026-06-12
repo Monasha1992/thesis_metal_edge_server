@@ -95,7 +95,35 @@ class MetalPipeline: @unchecked Sendable {
         self.commandQueue = device.makeCommandQueue()!
 
         // Load the compiled Metal library (all .metal files in the Sources bundle)
-        let library = try! device.makeDefaultLibrary(bundle: Bundle.module)
+        let library: MTLLibrary
+        do {
+            library = try device.makeDefaultLibrary(bundle: Bundle.module)
+        } catch {
+            print("Warning: Default Metal library not found in bundle. Attempting to compile from source...")
+            // Fallback: Compile from .metal source files in the bundle
+            var source = ""
+            let shaderFiles = ["DepthDilation", "DepthNormal", "DepthProcess", "SurfaceNets", "VolumeIntegration"]
+            for file in shaderFiles {
+                if let url = Bundle.module.url(forResource: file, withExtension: "metal", subdirectory: "Shaders"),
+                   let content = try? String(contentsOf: url) {
+                    source += content + "\n"
+                } else if let url = Bundle.module.url(forResource: file, withExtension: "metal"),
+                          let content = try? String(contentsOf: url) {
+                    source += content + "\n"
+                }
+            }
+            
+            if source.isEmpty {
+                fatalError("Could not find any Metal shader sources in bundle.")
+            }
+            
+            do {
+                library = try device.makeLibrary(source: source, options: nil)
+                print("Successfully compiled Metal library from source.")
+            } catch {
+                fatalError("Failed to compile Metal library from source: \(error)")
+            }
+        }
 
         // Compile each kernel function into a compute pipeline state
         // (This is like linking a shader program — done once at startup)
@@ -850,6 +878,62 @@ class MetalPipeline: @unchecked Sendable {
     // even though only `budget` are meshed per incoming depth frame.
     private var chunkQueue: [SIMD3<Int32>] = []
 
+    // ── Empty-chunk backoff ───────────────────────────────────────────────────
+    // Most in-range chunks are empty air (above/below the room geometry).
+    // Meshing them every cycle wastes the per-frame budget and slows down how
+    // often chunks with REAL geometry refresh. So chunks that come back empty
+    // are re-checked with exponential backoff (skip 1, then 3, then 7 cycles,
+    // capped) — new geometry appearing in a long-empty chunk is still noticed
+    // within a handful of cycles, while ~80 % of the budget stays on chunks
+    // that actually contain surfaces.
+    private var chunkEmptyStreak: [SIMD3<Int32>: Int] = [:]
+    private var chunkSkipCounter: [SIMD3<Int32>: Int] = [:]
+
+    // Chunks we have ever sent as non-empty. Lets us send an explicit
+    // "clear this cell" (vertCount == 0) exactly once when a previously
+    // occupied chunk becomes empty, instead of spamming empties every cycle.
+    private var nonEmptyChunks: Set<SIMD3<Int32>> = []
+
+    // ── Pre-allocated buffer slots for BATCHED chunk meshing ─────────────────
+    // All chunks of a frame are encoded into ONE command buffer with ONE
+    // waitUntilCompleted. The first implementation ran a separate command
+    // buffer (and GPU sync) per chunk — 8 serial round-trips a frame, which
+    // tripled server-side mesh time. Each slot owns fixed-size buffers
+    // matching the constant chunk-region size ((chunkSizeVox+2)³ cells).
+    private struct ChunkSlot {
+        let coordVertMap: MTLBuffer
+        let vertexBuffer: MTLBuffer
+        let triBuffer:    MTLBuffer
+        let vertCount:    MTLBuffer
+        let triCount:     MTLBuffer
+    }
+    private var chunkSlots: [ChunkSlot] = []
+    private var chunkRegionCells = 0     // cells per chunk region, set when slots build
+    private var chunkSlotMaxVerts = 0
+    private var chunkSlotMaxTriIdx = 0
+
+    // Build the per-slot buffer pool the first time (or grow it if budget rises).
+    // Slots are fixed-size because every chunk region is the same size:
+    // (chunkSizeVox + 2)³ cells (32³ chunk + 1-cell seam margin each side).
+    private func ensureChunkSlots(budget: Int) {
+        guard chunkSlots.count < budget else { return }
+
+        let side = Int(chunkSizeVox) + 2
+        chunkRegionCells   = side * side * side          // 39 304
+        chunkSlotMaxVerts  = max(chunkRegionCells / 3, 1)
+        chunkSlotMaxTriIdx = chunkRegionCells * 6
+
+        while chunkSlots.count < budget {
+            chunkSlots.append(ChunkSlot(
+                coordVertMap: device.makeBuffer(length: chunkRegionCells * 4,   options: .storageModeShared)!,
+                vertexBuffer: device.makeBuffer(length: chunkSlotMaxVerts * 24, options: .storageModeShared)!,
+                triBuffer:    device.makeBuffer(length: chunkSlotMaxTriIdx * 4, options: .storageModeShared)!,
+                vertCount:    device.makeBuffer(length: 4, options: .storageModeShared)!,
+                triCount:     device.makeBuffer(length: 4, options: .storageModeShared)!
+            ))
+        }
+    }
+
     /// One meshed chunk: its grid coordinate plus the extracted triangles.
     struct ChunkMesh {
         let coord: SIMD3<Int32>
@@ -927,34 +1011,107 @@ class MetalPipeline: @unchecked Sendable {
     // borders crack-free without any cross-chunk stitching.
     // ─────────────────────────────────────────────────────────────────────────
     func generateChunkMeshes(frame: DepthFrame, budget: Int) -> [ChunkMesh] {
-        guard volumeTexture != nil else { return [] }
+        guard let volume = volumeTexture else { return [] }
 
         let voxCount = SIMD3<Int32>(frame.voxelCount.x, frame.voxelCount.y, frame.voxelCount.z)
+        ensureChunkSlots(budget: budget)
 
-        // ── Refill the round-robin queue when exhausted ───────────────────────
-        if chunkQueue.isEmpty {
-            chunkQueue = inRangeChunks(frame: frame, voxCount: voxCount)
-        }
-
-        // ── Mesh up to `budget` chunks from the queue front ───────────────────
-        var out: [ChunkMesh] = []
-        while out.count < budget, !chunkQueue.isEmpty {
+        var selected: [(coord: SIMD3<Int32>, regionMin: SIMD3<Int32>, regionMax: SIMD3<Int32>)] = []
+        var safety = 0
+        while selected.count < budget && safety < 2048 {
+            safety += 1
+            if chunkQueue.isEmpty {
+                chunkQueue = inRangeChunks(frame: frame, voxCount: voxCount)
+                if chunkQueue.isEmpty { break }
+            }
             let c = chunkQueue.removeFirst()
-
-            // Chunk voxel region, expanded 1 cell each side for seam overlap
+            if let skip = chunkSkipCounter[c], skip > 0 {
+                chunkSkipCounter[c] = skip - 1
+                continue
+            }
             let base      = c &* chunkSizeVox
             let regionMin = max(base &- 1, SIMD3<Int32>(0, 0, 0))
             let regionMax = min(base &+ chunkSizeVox &+ 1, voxCount)
+            selected.append((c, regionMin, regionMax))
+        }
+        guard !selected.isEmpty else { return [] }
 
-            let mesh = meshRegion(regionMin: regionMin, regionMax: regionMax,
-                                  voxCount: voxCount, voxelSize: frame.voxelSize)
-            out.append(ChunkMesh(coord: c, mesh: mesh))
+        for i in 0..<selected.count {
+            let slot = chunkSlots[i]
+            memset(slot.coordVertMap.contents(), 0xFF, chunkRegionCells * 4)
+            slot.vertCount.contents().storeBytes(of: Int32(0), as: Int32.self)
+            slot.triCount.contents().storeBytes(of: Int32(0), as: Int32.self)
+        }
+
+        let commandBuffer = commandQueue.makeCommandBuffer()!
+        for (i, sel) in selected.enumerated() {
+            let slot = chunkSlots[i]
+            var params = MeshParams(voxCount: voxCount, voxSize: frame.voxelSize,
+                                    regionMin: sel.regionMin, regionMax: sel.regionMax)
+            let regionSize  = sel.regionMax &- sel.regionMin
+            let regionTotal = Int(regionSize.x) * Int(regionSize.y) * Int(regionSize.z)
+
+            let e1 = commandBuffer.makeComputeCommandEncoder()!
+            e1.setComputePipelineState(vertexPipeline)
+            e1.setTexture(volume, index: 0)
+            e1.setBuffer(slot.vertexBuffer, offset: 0, index: 0)
+            e1.setBuffer(slot.vertCount,    offset: 0, index: 1)
+            e1.setBuffer(slot.coordVertMap, offset: 0, index: 2)
+            e1.setBytes(&params, length: MemoryLayout<MeshParams>.size, index: 3)
+            e1.dispatchThreads(
+                MTLSize(width: regionTotal, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: vertexPipeline.threadExecutionWidth, height: 1, depth: 1))
+            e1.endEncoding()
+
+            let e2 = commandBuffer.makeComputeCommandEncoder()!
+            e2.setComputePipelineState(indexPipeline)
+            e2.setTexture(volume, index: 0)
+            e2.setBuffer(slot.coordVertMap, offset: 0, index: 0)
+            e2.setBuffer(slot.triBuffer,    offset: 0, index: 1)
+            e2.setBuffer(slot.triCount,     offset: 0, index: 2)
+            e2.setBytes(&params, length: MemoryLayout<MeshParams>.size, index: 3)
+            e2.setBuffer(slot.vertexBuffer, offset: 0, index: 4)
+            e2.dispatchThreads(
+                MTLSize(width: regionTotal, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: indexPipeline.threadExecutionWidth, height: 1, depth: 1))
+            e2.endEncoding()
+        }
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        var out: [ChunkMesh] = []
+        for (i, sel) in selected.enumerated() {
+            let slot = chunkSlots[i]
+            let vertCount = min(Int(slot.vertCount.contents().load(as: Int32.self)), chunkSlotMaxVerts)
+            let triCount  = min(Int(slot.triCount.contents().load(as: Int32.self)), chunkSlotMaxTriIdx)
+
+            if vertCount > 0 {
+                chunkEmptyStreak[sel.coord] = 0
+                chunkSkipCounter[sel.coord] = 0
+                nonEmptyChunks.insert(sel.coord)
+
+                let vertPtr = slot.vertexBuffer.contents().bindMemory(to: Float.self, capacity: vertCount * 6)
+                let verts   = Array(UnsafeBufferPointer(start: vertPtr, count: vertCount * 6))
+                let idxPtr  = slot.triBuffer.contents().bindMemory(to: UInt32.self, capacity: triCount)
+                let indices = Array(UnsafeBufferPointer(start: idxPtr, count: triCount))
+
+                out.append(ChunkMesh(coord: sel.coord,
+                                     mesh: MeshResult(vertices: verts, indices: indices,
+                                                      vertexCount: vertCount, triangleCount: triCount / 3)))
+            } else {
+                let streak = (chunkEmptyStreak[sel.coord] ?? 0) + 1
+                chunkEmptyStreak[sel.coord] = streak
+                chunkSkipCounter[sel.coord] = min(1 << min(streak, 3), 8) - 1
+
+                if nonEmptyChunks.remove(sel.coord) != nil {
+                    out.append(ChunkMesh(coord: sel.coord,
+                                         mesh: MeshResult(vertices: [], indices: [],
+                                                          vertexCount: 0, triangleCount: 0)))
+                }
+            }
         }
         return out
     }
-
-    // Collects every chunk coordinate whose centre is within
-    // (maxUpdateDist + half the chunk diagonal) of the camera, nearest first.
     private func inRangeChunks(frame: DepthFrame, voxCount: SIMD3<Int32>) -> [SIMD3<Int32>] {
         let eyeWorld  = cameraWorldPosition(frame: frame)
         let chunkSizeWorld = Float(chunkSizeVox) * frame.voxelSize          // e.g. 3.2 m
