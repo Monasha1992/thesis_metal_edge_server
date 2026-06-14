@@ -60,7 +60,7 @@ struct Vertex {
 
 // Parameters for both mesh kernels
 struct MeshParams {
-    int3  voxCount;   // Total volume dimensions (e.g. 128, 128, 128)
+    int3  voxCount;   // Total volume dimensions (1024×256×1024 in this project)
     float voxSize;    // Size of each voxel in metres (e.g. 0.1)
     int3  regionMin;  // Start of the region to mesh (voxel coordinates)
     int3  regionMax;  // End of the region to mesh (voxel coordinates)

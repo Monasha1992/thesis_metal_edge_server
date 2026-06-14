@@ -28,7 +28,7 @@ import simd
 //                   Only the first `numPlayers` slots hold real positions.
 //                   Remaining slots are zero and ignored by the integration shader.
 //
-//   Bytes 644+    : raw depth pixels (float32 per pixel, 320 pixels wide)
+//   Bytes 644+    : depth pixels (uint16 normalized-NDC, little-endian, 320 wide)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Fixed maximum number of player head slots sent per frame.
@@ -44,7 +44,7 @@ struct DepthFrame {
     let projInv: [float4x4]   // clip → camera space (used for unprojection)
 
     // ── Volume configuration ──────────────────────────────────────────────────
-    let voxelCount:    SIMD3<Int32>  // Grid dimensions, e.g. (128, 128, 128)
+    let voxelCount:    SIMD3<Int32>  // Grid dimensions — (1024, 256, 1024) from the Unity volume
     let voxelSize:     Float          // Metres per voxel, e.g. 0.1
     let voxelDist:     Float          // TSDF truncation distance, e.g. 0.2
     let maxUpdateDist: Float          // Integration depth limit in metres
@@ -58,7 +58,7 @@ struct DepthFrame {
     let playerHeads: [SIMD3<Float>]
 
     // ── Raw depth image ───────────────────────────────────────────────────────
-    let depthPixels: Data  // float32 array, row-major, width=320
+    let depthPixels: Data  // uint16 normalized-NDC, little-endian, row-major, width=320
     let width:       Int   // Hardcoded 320 (Quest depth sensor resolution)
     let height:      Int   // Computed from pixel count
 
@@ -142,9 +142,9 @@ func parseDepthFrame(_ data: Data) -> DepthFrame {
         playerHeads.append(SIMD3<Float>(x, y, z))
     }
 
-    // Remainder: raw float32 depth pixels
+    // Remainder: uint16 normalized-NDC depth pixels (2 bytes each)
     let depthPixels = data.subdata(in: offset..<data.count)
-    let pixelCount  = depthPixels.count / 4
+    let pixelCount  = depthPixels.count / 2
     let width       = 320
     let height      = pixelCount / width
 

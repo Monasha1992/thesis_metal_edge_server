@@ -18,13 +18,14 @@ import Network
 //     Byte 0      = message type (0x01 = depth frame)
 //     Bytes 1–4   = payload length as big-endian uint32
 //     Bytes 5–12  = uint64 timestamp (ms since epoch, for latency measurement)
-//     Bytes 13+   = frame data (matrices + volume config + depth pixels)
+//     Bytes 13+   = frame data (matrices + volume config + player heads + depth pixels)
 //
 //   Incoming (Mac → Quest):
-//     Byte 0      = message type (0x03 = triangle mesh)
+//     Byte 0      = message type (0x03 = single mesh, 0x04 = chunk batch)
 //     Bytes 1–4   = payload length as big-endian uint32
 //     Bytes 5–12  = uint64 timestamp echo (same value from incoming frame)
-//     Bytes 13+   = mesh data (vertex count + index count + vertices + indices)
+//     Bytes 13–28 = 4 × float32 server timings (total/parse/integrate/mesh ms)
+//     Bytes 29+   = mesh data (see serializeSingleMesh / serializeChunkBatch)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @main
@@ -129,7 +130,8 @@ struct EdgeMetalServer {
     //
     // TIMING:
     //   Each step is timed and printed so you can see where time is spent.
-    //   "wall" = real elapsed time from frame arrival to mesh sent.
+    //   "wall" = real elapsed time from frame arrival to mesh extracted
+    //   (serialization and the async TCP send are not included).
     // ─────────────────────────────────────────────────────────────────────────
     static func receivePayload(
         on connection: NWConnection, type: UInt8, remaining: Int, accumulated: Data
@@ -157,17 +159,18 @@ struct EdgeMetalServer {
 
                 // Step 1: Parse raw bytes into a structured DepthFrame.
                 //   First 8 bytes = latency timestamp (we echo this back to Quest).
-                //   Next 540 bytes = camera matrices + volume config.
-                //   Rest = raw float32 depth pixels.
+                //   Next 636 bytes = camera matrices + volume config + player heads.
+                //   Rest = uint16 normalized-NDC depth pixels (2 bytes each).
                 let frame = parseDepthFrame(accumulated)
                 let t1 = Date()
 
-                // Step 2: Upload the raw float32 depth pixels to a Metal GPU texture
+                // Step 2: Upload the uint16 depth pixels to a Metal GPU texture (.r16Unorm)
                 let depthTexture = metal.uploadDepthTexture(frame: frame)
                 let t2 = Date()
 
                 // Step 3: Dilate the depth image — fills holes caused by reflections
-                //   or sensor noise using 8 passes of jump-flood morphological dilation.
+                //   or sensor noise using jump-flood morphological dilation
+                //   (2 passes, ~one-voxel fill radius — see MetalPipeline.dilateDepth).
                 let dilatedDepth = metal.dilateDepth(depthTexture: depthTexture, frame: frame)
                 let t3 = Date()
 
@@ -188,7 +191,8 @@ struct EdgeMetalServer {
 
                 // Step 7: Integrate this depth frame into the persistent TSDF volume.
                 //   Each voxel stores: how far is it from the nearest surface?
-                //   Observations are blended using a weighted running average (weight capped at 30).
+                //   New readings are blended with a light 0.5 exponential blend
+                //   (anti-shake — tuning history in VolumeIntegration.metal).
                 metal.integrateDepth(
                     depthTexture: depthTexture,
                     normTexture:  normalsTexture,
@@ -301,6 +305,7 @@ struct EdgeMetalServer {
     //
     // Layout:
     //   8 bytes    — timestamp echo (uint64, same value received from Quest)
+    //   16 bytes   — server timings (4 × float32: total/parse/integrate/mesh ms)
     //   4 bytes    — vertex count (uint32)
     //   4 bytes    — index count (uint32)
     //   N×24 bytes — vertices: 6 floats each (pos.xyz + normal.xyz)
@@ -336,6 +341,7 @@ struct EdgeMetalServer {
     //
     // Layout:
     //   8 bytes  — timestamp echo (uint64, same value received from Quest)
+    //   16 bytes — server timings (4 × float32: total/parse/integrate/mesh ms)
     //   4 bytes  — chunk count (uint32)
     //   then per chunk:
     //     12 bytes   — chunk grid coordinate (3 × int32)

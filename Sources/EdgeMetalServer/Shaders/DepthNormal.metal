@@ -49,7 +49,7 @@ float3 ndcToWorldNorm(float2 uv, float depth, float4x4 projInv, float4x4 viewInv
 // depthNormals — Main compute kernel, one thread per pixel
 // ─────────────────────────────────────────────────────────────────────────────
 kernel void depthNormals(
-    texture2d<float, access::read>  depthTex [[texture(0)]],  // Input: dilated depth image
+    texture2d<float, access::read>  depthTex [[texture(0)]],  // Input: original (undilated) depth image
     texture2d<float, access::write> normTex  [[texture(1)]],  // Output: normal map
     constant NormParams& params              [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]

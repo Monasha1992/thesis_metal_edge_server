@@ -14,9 +14,11 @@ using namespace metal;
 //
 // HOW IT WORKS (Jump-Flood Dilation):
 //   Instead of checking every neighbour pixel (slow), we use a jump-flood
-//   approach: run 8 passes with step sizes 256 → 128 → 64 → 32 → 16 → 8 → 4 → 2 → 1
-//   Each pass lets valid depth values "jump" over large gaps in one step.
-//   This fills gaps up to 256 pixels wide in just 8 passes instead of 256.
+//   approach: a few passes with halving step sizes. The pass count comes from
+//   MetalPipeline.dilateDepth (dilationSteps, default 2 → step sizes 4, then 2).
+//   Each pass lets valid depth values "jump" over gaps in one step, and the
+//   acceptance radius below limits the fill to ~one voxel-width so silhouettes
+//   aren't eroded (tuning history in MetalPipeline.dilateDepth).
 //
 //   Each pixel stores: (original_x, original_y, depth_value, unused)
 //   so we always know where the depth value originally came from.
@@ -33,7 +35,7 @@ struct DilationParams {
     uint2 texSize;      // Width and height of the depth image in pixels
     float voxDist;      // TSDF truncation distance in metres (e.g. 0.2m)
     float voxSize;      // Size of one voxel in metres (e.g. 0.1m)
-    int stepSize;       // Current jump distance in pixels (256, 128, 64... 1)
+    int stepSize;       // Current jump distance in pixels (4, then 2, at the default 2 passes)
 };
 
 // 8 neighbour directions to sample (N, NE, E, SE, S, SW, W, NW)
@@ -77,7 +79,7 @@ kernel void initDepthDilation(
 //   - within a physically reasonable fill radius
 // ...then adopt that depth value.
 //
-// Called 8 times with step sizes: 256, 128, 64, 32, 16, 8, 4, 2 (then 1 implied)
+// Called dilationSteps times (default 2) with halving step sizes: 4, then 2.
 // Uses ping-pong buffers (src → dest, then swap) so reads and writes don't conflict.
 // ─────────────────────────────────────────────────────────────────────────────
 kernel void dilateDepthStep(

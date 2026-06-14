@@ -18,12 +18,13 @@ import simd
 //
 // PROCESSING STEPS (called in order per frame):
 //   1. uploadDepthTexture  — copies raw depth pixels into a GPU texture
-//   2. dilateDepth         — fills holes in the depth image (8 jump-flood passes)
+//   2. dilateDepth         — fills holes in the depth image (2 jump-flood passes by default)
 //   3. generateNormals     — estimates surface normals from depth gradients
 //   4. setupVolume         — creates the 3D TSDF texture (first frame only)
 //   5. setupFrustum        — pre-computes frustum voxel list (first frame only)
 //   6. integrateDepth      — fuses this frame into the TSDF volume
-//   7. generateMesh        — runs Surface Nets to extract a triangle mesh
+//   7. generateChunkMeshes — runs Surface Nets per chunk (or generateMesh in
+//                            legacy single-mesh mode) to extract triangles
 // ─────────────────────────────────────────────────────────────────────────────
 
 class MetalPipeline: @unchecked Sendable {
@@ -40,7 +41,7 @@ class MetalPipeline: @unchecked Sendable {
     // They are compiled once at init and reused for every frame.
     let depthStatsPipeline: MTLComputePipelineState   // (unused in main pipeline — debug helper)
     let initDilationPipeline: MTLComputePipelineState  // Copies depth into ping-pong buffer
-    let dilatePipeline: MTLComputePipelineState        // One dilation pass (called 8 times)
+    let dilatePipeline: MTLComputePipelineState        // One dilation pass (called dilationSteps times, default 2)
 
     // ── Dilation ping-pong textures ───────────────────────────────────────────
     // Jump-flood dilation reads from texA and writes to texB, then swaps them.
@@ -162,13 +163,15 @@ class MetalPipeline: @unchecked Sendable {
     // ─────────────────────────────────────────────────────────────────────────
     // uploadDepthTexture — Copies raw depth pixels from CPU memory to a GPU texture
     //
-    // The Quest sends depth as an array of 32-bit floats (one float per pixel).
-    // We create an R32Float (single-channel float) texture and copy the bytes in.
-    // The texture is then used as input to dilation, normals, and integration.
+    // The Quest sends depth as uint16 normalized-NDC values (one per pixel, 2
+    // bytes, little-endian). We create an .r16Unorm texture and copy the bytes
+    // in; Metal samples .r16Unorm back as a normalized float in [0,1], so every
+    // downstream shader (dilation, normals, integration) reads the same depth
+    // value it did when depth was sent as float32 — no shader maths change.
     // ─────────────────────────────────────────────────────────────────────────
     func uploadDepthTexture(frame: DepthFrame) -> MTLTexture {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r32Float,    // Single channel — just the depth value
+            pixelFormat: .r16Unorm,    // Single channel — 16-bit normalized depth
             width: frame.width,
             height: frame.height,
             mipmapped: false
@@ -177,13 +180,13 @@ class MetalPipeline: @unchecked Sendable {
 
         let texture = device.makeTexture(descriptor: descriptor)!
 
-        // Copy the raw float bytes directly into the texture
+        // Copy the raw uint16 bytes directly into the texture
         frame.depthPixels.withUnsafeBytes { ptr in
             texture.replace(
                 region: MTLRegionMake2D(0, 0, frame.width, frame.height),
                 mipmapLevel: 0,
                 withBytes: ptr.baseAddress!,
-                bytesPerRow: frame.width * 4   // 4 bytes per float
+                bytesPerRow: frame.width * 2   // 2 bytes per uint16
             )
         }
 
@@ -547,8 +550,8 @@ class MetalPipeline: @unchecked Sendable {
     //   3. Project that voxel onto the depth image to find the measured depth pixel
     //   4. Compute: signed distance = measured_depth - voxel_distance_from_camera
     //      (positive = voxel is in front of the surface, negative = behind)
-    //   5. Blend this new reading into the existing TSDF value using weighted average
-    //      (weight capped at 30, so old data doesn't dominate forever)
+    //   5. Blend this new reading into the existing TSDF value with a light 0.5
+    //      exponential blend (anti-shake — tuning history in VolumeIntegration.metal)
     //
     // Quality gates: readings are rejected if:
     //   - Outside the truncation band (too far from any surface)
@@ -821,7 +824,7 @@ class MetalPipeline: @unchecked Sendable {
     // MeshParams — Parameters passed to both Surface Nets GPU kernels
     // ─────────────────────────────────────────────────────────────────────────
     struct MeshParams {
-        var voxCount:  SIMD3<Int32>   // Full volume dimensions (e.g. 128, 128, 128)
+        var voxCount:  SIMD3<Int32>   // Full volume dimensions (1024×256×1024 in this project)
         var voxSize:   Float          // Size of each voxel in metres
         var regionMin: SIMD3<Int32>   // First voxel coordinate of the meshing region
         var regionMax: SIMD3<Int32>   // Last voxel coordinate of the meshing region
@@ -844,21 +847,20 @@ class MetalPipeline: @unchecked Sendable {
         var triangleCount: Int
     }
 
-    // ── coordVertMap buffer ────────────────────────────────────────────────────
+    // ── coordVertMap buffer (legacy single-mesh path only) ───────────────────
     // Shared between the two Surface Nets passes:
     //   Pass 1 writes: REGION-RELATIVE cell index → vertex index (-1 if none)
     //   Pass 2 reads:  looks up the 4 surrounding vertices to form a quad
     // Region-relative indexing (see SurfaceNets.metal header) keeps this buffer
-    // small: a 34³ chunk region needs ~157 KB; the legacy camera-box region
-    // ~7 MB — versus ~1 GB if it were indexed by absolute volume coordinates.
-    // Grow-only and reused across calls.
+    // small: the legacy camera-box region needs ~7 MB — versus ~1 GB if it were
+    // indexed by absolute volume coordinates. Grow-only and reused across calls.
+    // The chunked path uses the per-slot maps in `chunkSlots` instead.
     var coordVertMapBuffer: MTLBuffer?
 
-    // ── Pooled mesh output buffers ────────────────────────────────────────────
-    // Grow-only, shared by every meshRegion call (legacy camera-box path and
-    // per-chunk path alike). Per-chunk meshing runs up to `maxChunksPerFrame`
-    // dispatches per incoming frame — allocating fresh MTLBuffers for each
-    // would add measurable per-frame overhead.
+    // ── Pooled mesh output buffers (legacy single-mesh path only) ─────────────
+    // Grow-only, reused by every meshRegion call so the legacy path doesn't
+    // allocate fresh MTLBuffers per frame. The chunked path uses the
+    // fixed-size buffers in `chunkSlots` instead.
     private var meshVertexBuffer: MTLBuffer?
     private var meshTriBuffer:    MTLBuffer?
     private var meshVertCountBuffer: MTLBuffer?
@@ -955,7 +957,7 @@ class MetalPipeline: @unchecked Sendable {
     //     surrounding cells. Winding order is determined by which side is "inside".
     //
     // CAMERA-CENTRED BOUNDING BOX (key optimization):
-    //   Instead of meshing the entire 128³ volume (2M voxels → crash), we only mesh
+    //   Instead of meshing the entire 1024×256×1024 volume (~268M voxels → crash), we only mesh
     //   a cube centred around the camera's current position. The cube extends
     //   `maxUpdateDist / voxelSize + 2` voxels in each direction.
     //   This is computed purely from frame.viewInv (no GPU readback needed), making
@@ -994,15 +996,19 @@ class MetalPipeline: @unchecked Sendable {
     //   1. When the work queue is empty, refill it with every chunk whose
     //      centre lies within (maxUpdateDist + chunk radius) of the camera,
     //      sorted nearest-first.
-    //   2. Pop `budget` chunks off the queue and mesh each one.
+    //   2. Pop chunks off the queue — skipping any still in empty-chunk
+    //      backoff — until `budget` are selected, then encode ALL of them
+    //      into one command buffer (one GPU sync per frame, see chunkSlots).
     //
     // The rotation means all in-range chunks refresh within a few frames
     // (~30 in-range chunks / 8 per frame ≈ full refresh every 4 frames
     // ≈ each chunk at ~2.5 Hz with a 10 Hz send rate) while per-frame server
     // time stays bounded.
     //
-    // Empty results (vertexCount == 0) ARE returned — the client interprets
-    // them as "clear this chunk" so removed geometry disappears.
+    // An empty result (vertexCount == 0, "clear this chunk" on the client) is
+    // returned ONCE, when a previously non-empty chunk becomes empty; chunks
+    // that stay empty are suppressed and re-checked with exponential backoff
+    // (see chunkEmptyStreak / chunkSkipCounter).
     //
     // Each chunk's mesh region is expanded by 1 cell on every side. Border
     // cells get meshed by both neighbouring chunks; the duplicated seam
@@ -1178,14 +1184,15 @@ class MetalPipeline: @unchecked Sendable {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // meshRegion — Shared Surface Nets core: extracts triangles from one
-    // axis-aligned voxel region. Used by both the legacy camera-box path
-    // (generateMesh) and the per-chunk path (generateChunkMeshes).
+    // meshRegion — Surface Nets core for the LEGACY camera-box path
+    // (generateMesh / 0x03). Extracts triangles from one axis-aligned voxel
+    // region. The chunked path (generateChunkMeshes) no longer calls this —
+    // it encodes its own batched dispatches using the chunkSlots buffers.
     //
-    // All scratch buffers are pooled grow-only members so repeated per-chunk
-    // calls don't allocate. The coordVertMap is REGION-RELATIVE (matching
-    // SurfaceNets.metal), so only regionTotal × 4 bytes are cleared per call —
-    // ~157 KB for a chunk instead of ~1 GB for a full-volume map.
+    // Scratch buffers are pooled grow-only members so repeated calls don't
+    // allocate. The coordVertMap is REGION-RELATIVE (matching
+    // SurfaceNets.metal), so only regionTotal × 4 bytes are cleared per call
+    // instead of a ~1 GB full-volume map.
     // ─────────────────────────────────────────────────────────────────────────
     private func meshRegion(
         regionMin: SIMD3<Int32>, regionMax: SIMD3<Int32>,
