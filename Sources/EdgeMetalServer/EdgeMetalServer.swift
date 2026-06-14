@@ -52,23 +52,55 @@ struct EdgeMetalServer {
     // chunk roughly every 4 frames (~2.5 Hz per chunk at a 10 Hz send rate).
     static let maxChunksPerFrame = 8
 
-    static func main() {
-        let port: UInt16 = 9876
+    // ── Single-client guard ────────────────────────────────────────────────────
+    // This server instance owns ONE TSDF volume + chunk pipeline, so it serves
+    // exactly one headset at a time. A second headset must use a DIFFERENT
+    // server instance on the next port. `clientConnected` tracks whether the
+    // single slot is taken; the headset port-scans upward until it finds a free
+    // instance (see EdgeServerClient.ConnectLoop). All access is on the .main
+    // queue (Network.framework callbacks run there), so no locking is needed
+    // — hence nonisolated(unsafe): access is serialized by the queue, not the
+    // compiler.
+    nonisolated(unsafe) static var clientConnected = false
 
-        // Start a TCP server on port 9876
+    // Sent to a freshly-accepted client as a 1-byte "hello" so it knows it
+    // reached a FREE instance (vs a busy one, which we cancel without greeting).
+    static let helloByte: UInt8 = 0xAA
+
+    // Default base port. Launch additional instances on 9901, 9902, … e.g.
+    //   swift run EdgeMetalServer            # 9900
+    //   swift run EdgeMetalServer 9901       # second headset's instance
+    static let defaultPort: UInt16 = 9900
+
+    static func main() {
+        // Port from the first CLI argument, else the default base port.
+        let port: UInt16 = CommandLine.arguments.dropFirst().first.flatMap { UInt16($0) } ?? defaultPort
+
         let listener = try! NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
 
-        // Called every time a new Quest connects
+        // Called every time a Quest connects.
         listener.newConnectionHandler = { connection in
-            print("Client connected: \(connection.endpoint)")
+            // ── Busy? Refuse so the headset moves on to the next port ─────────
+            if clientConnected {
+                print("Refusing \(connection.endpoint) — instance busy (one client per server)")
+                connection.cancel()
+                return
+            }
 
-            // Open a fresh metrics CSV for this connection. The per-frame
-            // recorder appends rows to it as receivePayload processes each
-            // depth frame; the file is closed on process exit. See
-            // MetricsRecorder.swift for the format and join semantics.
-            MetricsRecorder.shared.startSession()
+            clientConnected = true
+            print("Client connected: \(connection.endpoint) on port \(port)")
+
+            // Open a fresh metrics CSV for this connection, tagged with the port
+            // so each headset's server-side log is identifiable. Closed when the
+            // client disconnects (slot freed) or on process exit.
+            MetricsRecorder.shared.startSession(port: port)
 
             connection.start(queue: .main)
+
+            // Greet the client so it can distinguish "accepted" from "busy".
+            connection.send(content: Data([helloByte]),
+                            completion: .contentProcessed { _ in })
+
             Self.receive(on: connection)
         }
 
@@ -77,6 +109,16 @@ struct EdgeMetalServer {
 
         // Keep the server running forever
         dispatchMain()
+    }
+
+    // Frees the single client slot and closes the metrics session so a new
+    // headset can be accepted. Idempotent.
+    static func clientDisconnected(_ reason: String) {
+        if clientConnected {
+            print("Client disconnected (\(reason)) — slot free")
+            MetricsRecorder.shared.endSession()
+        }
+        clientConnected = false
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -93,11 +135,13 @@ struct EdgeMetalServer {
         connection.receive(minimumIncompleteLength: 5, maximumLength: 5) { data, _, _, error in
             if let error = error {
                 print("Error: \(error)")
+                clientDisconnected("read error")
                 return
             }
 
             guard let data = data, data.count == 5 else {
                 print("Connection closed")
+                clientDisconnected("peer closed")
                 return
             }
 
@@ -140,10 +184,11 @@ struct EdgeMetalServer {
             data, _, _, error in
             if let error = error {
                 print("Error: \(error)")
+                clientDisconnected("read error")
                 return
             }
 
-            guard let data = data else { return }
+            guard let data = data else { clientDisconnected("peer closed"); return }
 
             var accumulated = accumulated
             accumulated.append(data)

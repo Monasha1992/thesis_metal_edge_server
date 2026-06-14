@@ -57,13 +57,16 @@ final class MetricsRecorder: @unchecked Sendable {
     //
     // Closes any previously-open session first. Creates the logs directory
     // if it doesn't exist. Writes the header row immediately. Subsequent
-    // record() calls append rows.
+    // record() calls append rows. The port is baked into the filename so that,
+    // when several server instances run at once (one per headset), each one's
+    // log is identifiable and two instances started in the same second don't
+    // collide.
     // ─────────────────────────────────────────────────────────────────────────
-    func startSession() {
+    func startSession(port: UInt16) {
         queue.sync {
             closeUnsafe()
 
-            // Build output path: ~/EdgeMetalServer/logs/server_<timestamp>.csv
+            // Build output path: ~/EdgeMetalServer/logs/server_p<port>_<timestamp>.csv
             let homeDir = FileManager.default.homeDirectoryForCurrentUser
             let logsDir = homeDir.appendingPathComponent("EdgeMetalServer/logs")
             try? FileManager.default.createDirectory(
@@ -75,7 +78,7 @@ final class MetricsRecorder: @unchecked Sendable {
             df.locale = Locale(identifier: "en_US_POSIX")
             df.timeZone = TimeZone(identifier: "UTC")
             let stamp = df.string(from: Date())
-            let url = logsDir.appendingPathComponent("server_\(stamp).csv")
+            let url = logsDir.appendingPathComponent("server_p\(port)_\(stamp).csv")
             currentPath = url
 
             // Header row — must match the columns documented in
