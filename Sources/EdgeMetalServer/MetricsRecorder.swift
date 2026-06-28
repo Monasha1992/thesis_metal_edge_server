@@ -72,11 +72,13 @@ final class MetricsRecorder: @unchecked Sendable {
             try? FileManager.default.createDirectory(
                 at: logsDir, withIntermediateDirectories: true)
 
-            // ISO-ish timestamp safe for filenames (no colons — Finder dislikes them)
+            // ISO-ish timestamp safe for filenames (no colons — Finder dislikes them).
+            // LOCAL device time for the filename only (human-friendly); the per-row
+            // wallMs column below stays UTC epoch-ms so the Quest↔Mac join is unaffected.
             let df = DateFormatter()
             df.dateFormat = "yyyyMMdd_HHmmss"
             df.locale = Locale(identifier: "en_US_POSIX")
-            df.timeZone = TimeZone(identifier: "UTC")
+            df.timeZone = TimeZone.current
             let stamp = df.string(from: Date())
             let url = logsDir.appendingPathComponent("server_p\(port)_\(stamp).csv")
             currentPath = url
