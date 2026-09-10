@@ -14,13 +14,13 @@ import Network
 //   Quest 3  ◄─────(triangle mesh)──────  Mac (this server)
 //
 // MESSAGE PROTOCOL (5-byte header + payload):
-//   Outgoing (Quest → Mac):
+//   Incoming (Quest → Mac):
 //     Byte 0      = message type (0x01 = depth frame)
 //     Bytes 1–4   = payload length as big-endian uint32
 //     Bytes 5–12  = uint64 timestamp (ms since epoch, for latency measurement)
 //     Bytes 13+   = frame data (matrices + volume config + player heads + depth pixels)
 //
-//   Incoming (Mac → Quest):
+//   Outgoing (Mac → Quest):
 //     Byte 0      = message type (0x03 = single mesh, 0x04 = chunk batch)
 //     Bytes 1–4   = payload length as big-endian uint32
 //     Bytes 5–12  = uint64 timestamp echo (same value from incoming frame)

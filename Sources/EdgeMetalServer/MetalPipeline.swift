@@ -828,6 +828,15 @@ class MetalPipeline: @unchecked Sendable {
         var voxSize:   Float          // Size of each voxel in metres
         var regionMin: SIMD3<Int32>   // First voxel coordinate of the meshing region
         var regionMax: SIMD3<Int32>   // Last voxel coordinate of the meshing region
+        // Buffer capacities handed to the kernels so their atomic allocators can
+        // bounds-check. Must stay in sync with `struct MeshParams` in
+        // SurfaceNets.metal — including the padding, which keeps
+        // MemoryLayout.size equal to .stride so setBytes(length:) sends the
+        // whole struct.
+        var maxVerts:  Int32 = 0
+        var maxTriIdx: Int32 = 0
+        var _pad0:     Int32 = 0
+        var _pad1:     Int32 = 0
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -922,8 +931,26 @@ class MetalPipeline: @unchecked Sendable {
 
         let side = Int(chunkSizeVox) + 2
         chunkRegionCells   = side * side * side          // 39 304
-        chunkSlotMaxVerts  = max(chunkRegionCells / 3, 1)
-        chunkSlotMaxTriIdx = chunkRegionCells * 6
+
+        // Capacities are the MATHEMATICAL WORST CASE, not a heuristic.
+        //
+        // Surface Nets emits at most one vertex per cell, so a region can never
+        // produce more than `chunkRegionCells` vertices. The previous
+        // `chunkRegionCells / 3` was an estimate of typical density; cluttered
+        // rooms exceeded it, the kernels wrote past the buffer, and the host
+        // then clamped vertCount below indices that had already been written —
+        // producing indices >= vertCount, which the client rejects (and which
+        // crashed PhysX before that guard existed). 16.8 % of chunk responses
+        // were lost to this on 2026-08-29, rising to 33.4 % on a 41-minute run.
+        //
+        // Each cell can emit up to 3 quads (one per axis) = 18 indices, so the
+        // index buffer's true bound is cells × 18.
+        //
+        // Cost: ~3.9 MB per slot (157 KB map + 943 KB verts + 2.8 MB indices)
+        // versus ~1.4 MB before. Trivial on an M3 Max, and it makes overflow
+        // impossible by construction rather than merely unlikely.
+        chunkSlotMaxVerts  = chunkRegionCells
+        chunkSlotMaxTriIdx = chunkRegionCells * 18
 
         while chunkSlots.count < budget {
             chunkSlots.append(ChunkSlot(
@@ -1053,7 +1080,9 @@ class MetalPipeline: @unchecked Sendable {
         for (i, sel) in selected.enumerated() {
             let slot = chunkSlots[i]
             var params = MeshParams(voxCount: voxCount, voxSize: frame.voxelSize,
-                                    regionMin: sel.regionMin, regionMax: sel.regionMax)
+                                    regionMin: sel.regionMin, regionMax: sel.regionMax,
+                                    maxVerts:  Int32(chunkSlotMaxVerts),
+                                    maxTriIdx: Int32(chunkSlotMaxTriIdx))
             let regionSize  = sel.regionMax &- sel.regionMin
             let regionTotal = Int(regionSize.x) * Int(regionSize.y) * Int(regionSize.z)
 
@@ -1088,8 +1117,24 @@ class MetalPipeline: @unchecked Sendable {
         var out: [ChunkMesh] = []
         for (i, sel) in selected.enumerated() {
             let slot = chunkSlots[i]
-            let vertCount = min(Int(slot.vertCount.contents().load(as: Int32.self)), chunkSlotMaxVerts)
-            let triCount  = min(Int(slot.triCount.contents().load(as: Int32.self)), chunkSlotMaxTriIdx)
+            let rawVerts = Int(slot.vertCount.contents().load(as: Int32.self))
+            let rawTris  = Int(slot.triCount.contents().load(as: Int32.self))
+
+            // Overflow detection. The kernels bounds-check their writes, so an
+            // overflowed buffer is merely INCOMPLETE rather than corrupt — but a
+            // partial chunk would still be applied by the client as if it were
+            // the whole cell, leaving holes in the collision mesh. Capacities
+            // are now the mathematical worst case, so this should never fire;
+            // if it does, the sizing assumption is wrong and we want to know
+            // rather than silently ship a broken chunk.
+            if rawVerts > chunkSlotMaxVerts || rawTris > chunkSlotMaxTriIdx {
+                FileHandle.standardError.write(Data(
+                    "[MetalPipeline] CHUNK OVERFLOW at \(sel.coord): verts \(rawVerts)/\(chunkSlotMaxVerts), indices \(rawTris)/\(chunkSlotMaxTriIdx) — chunk dropped\n".utf8))
+                continue
+            }
+
+            let vertCount = rawVerts
+            let triCount  = rawTris
 
             if vertCount > 0 {
                 chunkEmptyStreak[sel.coord] = 0
@@ -1210,9 +1255,13 @@ class MetalPipeline: @unchecked Sendable {
 
         // Buffer size estimates based on the region:
         //   maxVertices: at most 1 vertex per 3 cells (heuristic)
-        //   maxTriIndices: 6 indices per cell is a safe surface-fraction bound
-        let maxVertices   = max(regionTotal / 3, 1)
-        let maxTriIndices = regionTotal * 6
+        //   Sized to the mathematical worst case, matching the chunked path:
+        //   Surface Nets emits at most one vertex per cell, and at most 3 quads
+        //   (18 indices) per cell. The former `regionTotal / 3` and `× 6` were
+        //   density estimates that cluttered rooms exceeded, which produced
+        //   indices past the clamped vertex count. See ensureChunkSlots().
+        let maxVertices   = max(regionTotal, 1)
+        let maxTriIndices = regionTotal * 18
 
         // ── (Re)size pooled buffers, grow-only ────────────────────────────────
         if coordVertMapBuffer == nil || coordVertMapBuffer!.length < regionTotal * 4 {
@@ -1240,7 +1289,9 @@ class MetalPipeline: @unchecked Sendable {
             voxCount:  voxCount,
             voxSize:   voxelSize,
             regionMin: regionMin,
-            regionMax: regionMax
+            regionMax: regionMax,
+            maxVerts:  Int32(maxVertices),
+            maxTriIdx: Int32(maxTriIndices)
         )
 
         let commandBuffer = commandQueue.makeCommandBuffer()!

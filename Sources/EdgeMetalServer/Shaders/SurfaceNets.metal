@@ -64,6 +64,17 @@ struct MeshParams {
     float voxSize;    // Size of each voxel in metres (e.g. 0.1)
     int3  regionMin;  // Start of the region to mesh (voxel coordinates)
     int3  regionMax;  // End of the region to mesh (voxel coordinates)
+    // Buffer capacities. Both passes allocate slots with an atomic counter that
+    // can run past the end of its buffer when a region is denser than expected.
+    // Without these the kernels write out of bounds AND record indices the host
+    // later clamps away, producing indices >= vertCount — which crashes PhysX on
+    // the client's bake thread. Capacities are now sized to the mathematical
+    // worst case host-side, so these guards should never fire; they exist so
+    // that if the sizing is ever wrong the mesh degrades instead of corrupting.
+    int   maxVerts;   // Capacity of `vertices` (in vertices)
+    int   maxTriIdx;  // Capacity of `triangles` (in indices)
+    int   _pad0;      // Keep size == stride so the host's MemoryLayout.size matches
+    int   _pad1;
 };
 
 // The 8 corners of a unit voxel cube (local offsets from the cell origin)
@@ -187,6 +198,16 @@ kernel void surfaceNetsVertices(
 
     // Atomically grab the next available slot in the vertex buffer
     int vertIdx = atomic_fetch_add_explicit(vertexCounter, 1, memory_order_relaxed);
+
+    // Bounds guard — never write past the buffer, and never record an index the
+    // host would have to clamp away. Marking the cell INVALID makes Pass 2 skip
+    // every quad that would have referenced it, so the mesh loses a few faces
+    // instead of gaining a dangling index.
+    if (vertIdx >= params.maxVerts) {
+        coordVertMap[flattenCoord(localCoord, regionSize)] = INVALID_VERTEX;
+        return;
+    }
+
     vertices[vertIdx] = Vertex { pos, norm };
 
     // Record this cell's vertex index (region-relative) so Pass 2 can look it up
@@ -264,6 +285,11 @@ kernel void surfaceNetsIndices(
 
         // Atomically reserve 6 index slots (2 triangles × 3 indices each)
         int triIdx = atomic_fetch_add_explicit(triCounter, 6, memory_order_relaxed);
+
+        // Bounds guard — see MeshParams. Drop the quad rather than write past
+        // the buffer. The host also detects counter overflow and discards the
+        // whole chunk, so a partially-filled buffer is never transmitted.
+        if (triIdx + 6 > params.maxTriIdx) continue;
 
         // Winding order: flip based on which side is "inside" (negative TSDF)
         // This ensures the triangle normal always faces outward from the surface
